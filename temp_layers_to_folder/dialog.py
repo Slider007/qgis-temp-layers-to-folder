@@ -138,6 +138,13 @@ class SaveTempLayersDialog(QDialog):
 
         # --- параметры
         self.replace = QCheckBox()
+        self.structure = QCheckBox("Сохранять структуру папок")
+        self.structure.setToolTip(
+            "Файлы лягут в такие же подпапки, как исходные, а не все в одну папку: "
+            "«Проект/Данные/Растры/dem.tif» → «<папка>/Данные/Растры/dem.tif». Подпапки считаются "
+            "от папки проекта; файлы вне неё — от их общей папки.\n"
+            "Слои в памяти, временные и из баз данных — в саму папку. "
+            "При формате «все слои в одном файле» подпапки получают только растры.")
         self.styles = QCheckBox("Сохранить стили слоёв")
         self.styles.setToolTip("Файл .qml рядом с данными или стиль по умолчанию внутри GeoPackage — "
                                "при открытии файла стиль подхватится сам.")
@@ -147,7 +154,7 @@ class SaveTempLayersDialog(QDialog):
         self.pkg_fonts.setToolTip("Шрифты подписей, значков и макетов. Платные и шрифты без указанной "
                                   "лицензии не копируются — они перечисляются в «Состав.txt».")
         self._pkg_widgets = (self.pkg_fonts,)
-        for w in (self.replace, self.styles, self.overwrite) + self._pkg_widgets:
+        for w in (self.replace, self.structure, self.styles, self.overwrite) + self._pkg_widgets:
             root.addWidget(w)
         hint = QLabel("Растры сохраняются отдельными файлами независимо от выбранного формата: "
                       "без смены СК — копируются как есть (VRT и растры из баз — в GeoTIFF), "
@@ -215,6 +222,7 @@ class SaveTempLayersDialog(QDialog):
         self._mode = mode if mode in self._radios else MODE_TEMP
         self._radios[self._mode].setChecked(True)
         self.pkg_fonts.setChecked(_bool(s.value(SETTINGS + "pkg_fonts"), True))
+        self.structure.setChecked(_bool(s.value(SETTINGS + "keep_structure"), False))
         self.styles.setChecked(_bool(s.value(SETTINGS + "styles"), True))
         self.overwrite.setChecked(_bool(s.value(SETTINGS + "overwrite"), False))
         crs = QgsCoordinateReferenceSystem()
@@ -235,6 +243,7 @@ class SaveTempLayersDialog(QDialog):
             self._replace[self._mode] = self.replace.isChecked()
         s.setValue(SETTINGS + "mode", self._mode)
         s.setValue(SETTINGS + "pkg_fonts", self.pkg_fonts.isChecked())
+        s.setValue(SETTINGS + "keep_structure", self.structure.isChecked())
         s.setValue(SETTINGS + "replace", self._replace[MODE_TEMP])
         s.setValue(SETTINGS + "replace_all", self._replace[MODE_ALL])
         s.setValue(SETTINGS + "styles", self.styles.isChecked())
@@ -254,6 +263,8 @@ class SaveTempLayersDialog(QDialog):
         # при сборке слои всегда переключаются, а папка — data_all рядом с проектом
         self.replace.setVisible(not package)
         self.overwrite.setVisible(not package)
+        # у временных слоёв нет исходных папок
+        self.structure.setVisible(self._mode != MODE_TEMP)
         self.folder.setVisible(not package)
         self.folder_label.setVisible(not package)
         for w in self._pkg_widgets:
@@ -380,6 +391,11 @@ class SaveTempLayersDialog(QDialog):
             self.refresh()
             return
 
+        subdirs = None
+        if self._mode != MODE_TEMP and self.structure.isChecked():
+            # сначала сама папка сохранения: файл из неё остаётся в своей подпапке
+            subdirs = saver.structure_subdirs(items, [folder, self.project.absolutePath()])
+
         self._start()
         try:
             results = saver.save_layers(
@@ -391,6 +407,7 @@ class SaveTempLayersDialog(QDialog):
                 crs=self.crs.crs(),
                 progress=self._on_progress,
                 is_cancelled=lambda: self._cancel,
+                subdirs=subdirs,
             )
         except saver.Cancelled:
             results = None
@@ -452,7 +469,8 @@ class SaveTempLayersDialog(QDialog):
                 self.project, items, self.format.currentData(), crs=crs,
                 save_styles=self.styles.isChecked(), include_fonts=self.pkg_fonts.isChecked(),
                 save_project=lambda: self.iface.actionSaveProject().trigger(),
-                progress=self._on_progress, is_cancelled=lambda: self._cancel)
+                progress=self._on_progress, is_cancelled=lambda: self._cancel,
+                keep_structure=self.structure.isChecked())
         except saver.Cancelled:
             self.log.appendPlainText("Отменено. Часть слоёв могла уже переключиться на data_all — "
                                      "проект не сохранён, можно закрыть его без сохранения.")
@@ -541,7 +559,7 @@ class SaveTempLayersDialog(QDialog):
     def _set_controls_enabled(self, enabled):
         for w in tuple(self._radios.values()) + self._pkg_widgets + (
                 self.folder, self.format, self.crs, self.gpkg_name, self.layers, self.btn_all,
-                self.btn_none, self.btn_refresh, self.replace, self.styles,
+                self.btn_none, self.btn_refresh, self.replace, self.structure, self.styles,
                 self.overwrite, self.btn_save):
             w.setEnabled(enabled)
         self.btn_close.setText("Закрыть" if enabled else "Отмена")

@@ -340,10 +340,12 @@ def readme_text(name, crs, layers, online, excluded, font_info, images):
 
 def consolidate_project(project, items, fmt_key, crs=None, save_styles=True, include_fonts=True,
                         save_project=None, progress=None, is_cancelled=None, font_dirs=None,
-                        today=None):
+                        today=None, keep_structure=False):
     """Собирает проект в data_all и делает архив. items — выбранные слои
     [(layer, kind, temporary)]. save_project — как сохранить проект (в QGIS —
     через стандартное действие «Сохранить»), по умолчанию project.write().
+    keep_structure — раскладывать файлы в data_all по тем же подпапкам, что и
+    исходные (относительно папки проекта), а не складывать в одну.
 
     Возвращает словарь с итогами.
     """
@@ -368,10 +370,14 @@ def consolidate_project(project, items, fmt_key, crs=None, save_styles=True, inc
         needs_crs = (use_crs is not None and layer.isSpatial() and layer.crs().isValid()
                      and layer.crs() != use_crs)
         (todo if not inside or needs_crs else already).append(item)
+    # слой, уже лежащий в data_all, остаётся в своей подпапке — поэтому data_all первой
+    subdirs = saver.structure_subdirs(todo, [target, os.path.dirname(project_file)]) \
+        if keep_structure else None
     results = saver.save_layers(
         project, todo, target, fmt_key, gpkg_name=project_base_name(project), replace=True,
         save_styles=save_styles, overwrite=False, crs=use_crs,
-        progress=lambda i, total, n: step(len(already) + i, n), is_cancelled=is_cancelled)
+        progress=lambda i, total, n: step(len(already) + i, n), is_cancelled=is_cancelled,
+        subdirs=subdirs)
 
     step(len(items), "картинки и проект")
     chosen = {layer.id() for layer, *_ in items}

@@ -189,6 +189,54 @@ def _source_files(project):
     return {os.path.realpath(p) for p in (layer_path(l) for l in project.mapLayers().values()) if p}
 
 
+def _relative_inside(folder, anchor):
+    """Путь folder относительно anchor, если folder лежит внутри anchor, иначе None.
+    Сначала как записано (ссылки на папки не раскрываются), затем через realpath:
+    на macOS /var и /private/var — одна папка."""
+    for norm in (lambda p: os.path.normpath(os.path.abspath(p)), os.path.realpath):
+        a, f = norm(anchor), norm(folder)
+        try:
+            if os.path.normcase(os.path.commonpath([a, f])) == os.path.normcase(a):
+                return os.path.relpath(f, a)
+        except ValueError:  # разные диски в Windows
+            pass
+    return None
+
+
+def structure_subdirs(items, anchors):
+    """Подпапки, повторяющие расположение исходных файлов: {id слоя: подпапка}.
+
+    Файл внутри одной из папок anchors (берётся первая подходящая, например
+    папка проекта) — путь относительно неё: «Проект/Данные/Растры/dem.tif» →
+    «Данные/Растры». Остальные файлы — относительно их общей папки, включая её
+    имя: «D:/Архив/Топо/реки.shp» и «D:/Архив/Почвы/п.shp» → «Архив/Топо» и
+    «Архив/Почвы». Слои в памяти, временные и из баз данных в словарь не
+    попадают — они ложатся в саму папку сохранения.
+    """
+    anchors = [a for a in anchors if a]
+    result, outside = {}, {}
+    for layer, _kind, temporary in items:
+        path = "" if temporary else layer_path(layer)
+        if not path:
+            continue
+        src_dir = os.path.dirname(os.path.abspath(path))
+        for anchor in anchors:
+            rel = _relative_inside(src_dir, anchor)
+            if rel is not None:
+                result[layer.id()] = rel
+                break
+        else:
+            outside[layer.id()] = os.path.normpath(src_dir)
+    by_drive = {}
+    for lid, d in outside.items():
+        by_drive.setdefault(os.path.normcase(os.path.splitdrive(d)[0]), []).append(lid)
+    for ids in by_drive.values():
+        parent = os.path.dirname(os.path.commonpath([outside[i] for i in ids]))
+        for i in ids:
+            result[i] = os.path.relpath(outside[i], parent)
+    return {lid: rel for lid, rel in result.items() if rel != os.curdir}
+
+
 # ---------------------------------------------------------------- имена
 
 def safe_name(name):
@@ -391,9 +439,11 @@ def _repoint(layer, uri, provider, project, crs=None):
 
 def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 replace=True, save_styles=True, overwrite=False, crs=None,
-                progress=None, is_cancelled=None, own_fields_only=None):
+                progress=None, is_cancelled=None, own_fields_only=None, subdirs=None):
     """Сохраняет слои items = [(layer, kind, temporary), ...] в папку folder.
 
+    subdirs — {id слоя: подпапка внутри folder} (см. structure_subdirs); слои
+    без подпапки и общий GeoPackage ложатся в саму folder.
     crs — система координат для сохранения; None / недействительная — как у слоя.
     Исходные данные постоянных слоёв не меняются: правки из режима
     редактирования попадают только в копию, а файлы, из которых читают слои
@@ -414,8 +464,13 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
     tc = project.transformContext()
     protected = _source_files(project)
 
+    subdirs = subdirs or {}
+    taken_by_dir = {}  # {папка: занятые в этом запуске имена (в нижнем регистре)}
+
+    def taken_in(dest):
+        return taken_by_dir.setdefault(os.path.normcase(os.path.abspath(dest)), set())
+
     single_path = ""
-    taken = set()  # занятые в этом запуске имена (в нижнем регистре)
     if fmt["single"]:
         gpkg_file = safe_name(gpkg_name)
         if not gpkg_file.lower().endswith(".gpkg"):
@@ -423,7 +478,7 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
         single_path = os.path.join(folder, gpkg_file)
         if not overwrite or os.path.realpath(single_path) in protected:
             # в этот GeoPackage смотрят слои проекта — его таблицы не трогаем
-            taken |= _existing_gpkg_layers(single_path)
+            taken_in(folder).update(_existing_gpkg_layers(single_path))
 
     results = []
     total = len(items)
@@ -434,6 +489,9 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
         if progress:
             progress(i, total, name)
         base = safe_name(name)
+        sub = subdirs.get(layer.id())
+        dest = os.path.join(folder, sub) if sub else folder
+        taken = taken_in(dest)
         res = {"id": layer.id(), "name": name, "ok": False, "path": "", "message": "",
                "uri": "", "provider": "", "crs": None}
         notes = []
@@ -460,7 +518,8 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
             res["crs"] = target
 
             if kind == "raster":
-                path, stem = _save_raster(layer, folder, base, overwrite, taken, protected, target)
+                os.makedirs(dest, exist_ok=True)
+                path, stem = _save_raster(layer, dest, base, overwrite, taken, protected, target)
                 taken.add(stem.lower())
                 if save_styles:
                     layer.saveNamedStyle(os.path.splitext(path)[0] + ".qml")
@@ -470,8 +529,9 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 res.update(ok=True, path=path)
 
             elif fmt["single"]:
-                layer_name = _unique(base, lambda c: c.lower() in taken)
-                taken.add(layer_name.lower())
+                tables = taken_in(folder)  # общий GeoPackage — в корне, без подпапок
+                layer_name = _unique(base, lambda c: c.lower() in tables)
+                tables.add(layer_name.lower())
                 action = CREATE_LAYER if os.path.exists(single_path) else CREATE_FILE
                 new_file, new_layer = _write_vector(layer, single_path, driver, layer_name, action, tc, ct,
                                                     own_fields_only=own_only)
@@ -494,14 +554,15 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 def is_taken(c):
                     if c.lower() in taken:
                         return True
-                    paths = [os.path.join(folder, c + p) for p in parts]
+                    paths = [os.path.join(dest, c + p) for p in parts]
                     if any(os.path.realpath(p) in protected for p in paths):
                         return True  # из этого файла читает слой проекта
                     return not overwrite and any(os.path.exists(p) for p in paths)
 
                 stem = _unique(base, is_taken)
                 taken.add(stem.lower())
-                path = os.path.join(folder, stem + "." + ext)
+                os.makedirs(dest, exist_ok=True)
+                path = os.path.join(dest, stem + "." + ext)
                 new_file, new_layer = _write_vector(layer, path, driver, stem, CREATE_FILE, tc, ct,
                                                     own_fields_only=own_only)
                 if not os.path.exists(new_file):

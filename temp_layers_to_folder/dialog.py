@@ -290,6 +290,9 @@ class SaveTempLayersDialog(QDialog):
     def _find(self):
         return saver.find_layers(self.project, temporary_only=self._mode == MODE_TEMP)
 
+    def busy(self):
+        return self._busy
+
     # ------------------------------------------------------------ список
     def _add_item(self, layer, text, fmt="{}   ({})"):
         item = QListWidgetItem(fmt.format(layer.name(), text))
@@ -320,6 +323,7 @@ class SaveTempLayersDialog(QDialog):
             self.layers.addItem(item)
         self.layers.blockSignals(False)
         self._update_count()
+        self._update_package_hint()  # окно немодальное: проект могли сохранить под другим именем
 
     def _items(self):
         for i in range(self.layers.count()):

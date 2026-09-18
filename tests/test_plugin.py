@@ -680,6 +680,38 @@ def test_toolbar_buttons():
         assert own_toolbars() == [] and menus == []
 
 
+def test_plugin_window_non_modal():
+    """Окно немодальное и одно: повторное нажатие поднимает тот же экземпляр,
+    выгрузка плагина закрывает окно."""
+    from qgis.PyQt.QtWidgets import QMainWindow
+
+    import temp_layers_to_folder
+
+    make_project()
+    win = QMainWindow()
+
+    class Bar:
+        def pushMessage(self, *a, **k): pass
+
+    class Iface:
+        def mainWindow(self): return win
+        def messageBar(self): return Bar()
+        def layerTreeView(self): return None
+        def addToolBar(self, name): return win.addToolBar(name)
+        def addPluginToMenu(self, m, a): pass
+        def removePluginMenu(self, m, a): pass
+
+    plugin = temp_layers_to_folder.classFactory(Iface())
+    plugin.initGui()
+    plugin.run()
+    d = plugin.dialog
+    assert d.isVisible() and not d.isModal()
+    plugin.run()
+    assert plugin.dialog is d and d.isVisible()
+    plugin.unload()
+    assert plugin.dialog is None and not d.isVisible()
+
+
 def test_dialog():
     from qgis.PyQt.QtWidgets import QMainWindow, QMessageBox
 

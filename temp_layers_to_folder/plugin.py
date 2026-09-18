@@ -78,6 +78,7 @@ class SaveTempLayersPlugin:
             self.action.deleteLater()
             self.action = None
         if self.dialog:
+            self.dialog.close()
             self.dialog.deleteLater()
             self.dialog = None
 
@@ -86,6 +87,9 @@ class SaveTempLayersPlugin:
 
         if self.dialog is None:
             self.dialog = SaveTempLayersDialog(self.iface, self.iface.mainWindow())
-        else:
+        elif not self.dialog.busy():
             self.dialog.refresh()
-        self.dialog.exec()
+        # немодальное окно: QGIS остаётся доступным, повторный вызов поднимает то же окно
+        self.dialog.show()
+        self.dialog.raise_()
+        self.dialog.activateWindow()

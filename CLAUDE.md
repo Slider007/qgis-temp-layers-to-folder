@@ -20,7 +20,11 @@
 2. Поднять `version=` и дописать `changelog=` в `temp_layers_to_folder/metadata.txt`.
 3. После подтверждения — коммит и пуш, затем релиз с архивом:
    `gh release create vX.Y.Z "$(./build_zip.sh)" --title X.Y.Z --notes "…"`.
-4. Обновить установленную копию у пользователя (это копия, не ссылка):
+4. Разослать версию сотрудникам: `gh workflow run deploy.yml -R Slider007/altan.su`.
+   Деплой сайта заберёт архив этого релиза в репозиторий модулей
+   `https://altan.su/qgis/plugins.xml` — через пару минут там новая `version`.
+   Без zip в релизе деплой сайта остановится.
+5. Обновить установленную копию у пользователя (это копия, не ссылка):
    `~/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins/temp_layers_to_folder`.
 
 ## Грабли

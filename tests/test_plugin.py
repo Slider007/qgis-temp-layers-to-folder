@@ -649,11 +649,13 @@ def test_toolbar_buttons():
     bar.addAction("Развернуть все")
     dock.setWidget(bar)
 
+    menus = []
+
     class Iface:
         def mainWindow(self): return win
         def layerTreeView(self): return None
-        def addPluginToMenu(self, m, a): pass
-        def removePluginMenu(self, m, a): pass
+        def addPluginToMenu(self, m, a): menus.append((m, a.text()))
+        def removePluginMenu(self, m, a): menus.remove((m, a.text()))
 
         def addToolBar(self, name):
             return win.addToolBar(name)
@@ -669,12 +671,13 @@ def test_toolbar_buttons():
         assert bar.actions()[-2].isSeparator()
         own = own_toolbars()
         assert len(own) == 1 and own[0].windowTitle() == "Временные слои", own
+        assert menus == [("&Альтан-Эко", "Сохранить временные слои…")], menus  # общее подменю компании
         assert [a.text() for a in own[0].actions()] == ["Сохранить временные слои…"]
         assert own[0].isMovable()
         plugin.unload()
         QgsApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)  # выполнить deleteLater
         assert [a.text() for a in bar.actions()] == ["Развернуть все"], [a.text() for a in bar.actions()]
-        assert own_toolbars() == []
+        assert own_toolbars() == [] and menus == []
 
 
 def test_dialog():

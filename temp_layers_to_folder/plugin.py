@@ -9,7 +9,9 @@ try:  # Qt6 / QGIS 4: QAction живёт в QtGui
 except ImportError:  # Qt5 / QGIS 3
     from qgis.PyQt.QtWidgets import QAction
 
-MENU = "&Сохранение временных слоёв"
+# Общее подменю модулей компании в «Модулях». QGIS находит подменю по названию,
+# поэтому у всех наших модулей эта строка должна совпадать буква в букву.
+MENU = "&Альтан-Эко"
 TOOLBAR_NAME = "Временные слои"
 TOOLBAR_ID = "TempLayersToFolderToolbar"  # по нему QGIS запоминает место панели
 

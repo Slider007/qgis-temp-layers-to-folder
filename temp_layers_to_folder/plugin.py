@@ -4,6 +4,8 @@ from qgis.core import QgsApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QDockWidget, QToolBar
 
+from . import altan_toolbar
+
 try:  # Qt6 / QGIS 4: QAction живёт в QtGui
     from qgis.PyQt.QtGui import QAction
 except ImportError:  # Qt5 / QGIS 3
@@ -12,8 +14,6 @@ except ImportError:  # Qt5 / QGIS 3
 # Общее подменю модулей компании в «Модулях». QGIS находит подменю по названию,
 # поэтому у всех наших модулей эта строка должна совпадать буква в букву.
 MENU = "&Альтан-Эко"
-TOOLBAR_NAME = "Временные слои"
-TOOLBAR_ID = "TempLayersToFolderToolbar"  # по нему QGIS запоминает место панели
 
 
 class SaveTempLayersPlugin:
@@ -21,7 +21,6 @@ class SaveTempLayersPlugin:
         self.iface = iface
         self.action = None
         self.dialog = None
-        self.toolbar = None
         self.layers_toolbar = None
         self.layers_separator = None
 
@@ -33,10 +32,7 @@ class SaveTempLayersPlugin:
         self.action = QAction(icon, "Сохранить временные слои…", self.iface.mainWindow())
         self.action.setToolTip("Сохранить временные (или все) слои проекта в выбранную папку")
         self.action.triggered.connect(self.run)
-        self.toolbar = self.iface.addToolBar(TOOLBAR_NAME)
-        self.toolbar.setObjectName(TOOLBAR_ID)
-        self.toolbar.setToolTip(TOOLBAR_NAME)
-        self.toolbar.addAction(self.action)
+        altan_toolbar.add_action(self.iface, self.action)
         self.iface.addPluginToMenu(MENU, self.action)
         self._add_to_layers_panel()
 
@@ -69,11 +65,8 @@ class SaveTempLayersPlugin:
             except RuntimeError:  # панель уже удалена при закрытии QGIS
                 pass
             self.layers_toolbar = self.layers_separator = None
-        if self.toolbar is not None:
-            self.iface.mainWindow().removeToolBar(self.toolbar)
-            self.toolbar.deleteLater()
-            self.toolbar = None
         if self.action:
+            altan_toolbar.remove_action(self.iface, self.action)
             self.iface.removePluginMenu(MENU, self.action)
             self.action.deleteLater()
             self.action = None

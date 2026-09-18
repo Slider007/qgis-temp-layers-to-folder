@@ -637,7 +637,8 @@ def test_joins_relations_expressions():
 
 
 def test_toolbar_buttons():
-    """Своя панель и кнопка на панели «Слои» появляются по одной и убираются при выгрузке."""
+    """Кнопка на общей панели «Альтан-Эко» и на панели «Слои» появляется по одной
+    и убирается при выгрузке."""
     from qgis.PyQt.QtWidgets import QDockWidget, QMainWindow, QToolBar
 
     import temp_layers_to_folder
@@ -661,7 +662,7 @@ def test_toolbar_buttons():
             return win.addToolBar(name)
 
     def own_toolbars():
-        return [t for t in win.findChildren(QToolBar) if t.objectName() == "TempLayersToFolderToolbar"]
+        return [t for t in win.findChildren(QToolBar) if t.objectName() == "AltanEcoToolbar"]
 
     for _ in range(2):  # повторная загрузка не должна дублировать кнопки
         plugin = temp_layers_to_folder.classFactory(Iface())
@@ -670,10 +671,10 @@ def test_toolbar_buttons():
         assert texts[-1] == "Сохранить временные слои…" and texts.count(texts[-1]) == 1, texts
         assert bar.actions()[-2].isSeparator()
         own = own_toolbars()
-        assert len(own) == 1 and own[0].windowTitle() == "Временные слои", own
+        assert len(own) == 1 and own[0].windowTitle() == "Альтан-Эко", own
         assert menus == [("&Альтан-Эко", "Сохранить временные слои…")], menus  # общее подменю компании
         assert [a.text() for a in own[0].actions()] == ["Сохранить временные слои…"]
-        assert own[0].isMovable()
+        assert own[0].isMovable() and own[0].isFloatable()
         plugin.unload()
         QgsApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)  # выполнить deleteLater
         assert [a.text() for a in bar.actions()] == ["Развернуть все"], [a.text() for a in bar.actions()]

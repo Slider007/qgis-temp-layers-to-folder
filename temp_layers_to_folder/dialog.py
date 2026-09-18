@@ -21,16 +21,21 @@ from qgis.PyQt.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QVBoxLayout,
 )
 
 from . import saver
 
 SETTINGS = "temp_layers_to_folder/"
-KIND_LABELS = {
-    "memory": "в памяти",
-    "vector": "временный файл",
-    "raster": "временный растр",
+MODE_TEMP, MODE_ALL = "temp", "all"
+REPLACE_TEXT = {
+    MODE_TEMP: ("Заменить временные слои в проекте сохранёнными",
+                "Слои проекта переключатся на сохранённые файлы и перестанут быть временными. "
+                "Стиль, порядок и связи сохранятся."),
+    MODE_ALL: ("Переключить слои проекта на сохранённые копии",
+               "Проект будет смотреть на новые файлы вместо исходных данных. Исходные файлы "
+               "и базы не меняются. Выключено — копии просто лягут в папку."),
 }
 
 CHECKED = Qt.CheckState.Checked
@@ -54,15 +59,25 @@ class SaveTempLayersDialog(QDialog):
         self._busy = False
         self._cancel = False
 
-        self.setWindowTitle("Сохранить временные слои")
+        self.setWindowTitle("Сохранение слоёв в папку")
         self.setMinimumWidth(560)
         root = QVBoxLayout(self)
 
-        # --- куда и как
+        # --- какие слои, куда и как
         form = QFormLayout()
+        self.mode_temp = QRadioButton("Только временные")
+        self.mode_all = QRadioButton("Все слои проекта")
+        self.mode_all.setToolTip("Например, чтобы сохранить весь проект в новой системе координат. "
+                                 "Онлайн-слои (WMS, XYZ) и облака точек сохранить нельзя.")
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self.mode_temp)
+        mode_row.addWidget(self.mode_all)
+        mode_row.addStretch()
+        form.addRow("Какие слои:", mode_row)
+
         self.folder = QgsFileWidget()
         self.folder.setStorageMode(saver._enum(QgsFileWidget, "StorageMode", "GetDirectory"))
-        self.folder.setDialogTitle("Папка для сохранения временных слоёв")
+        self.folder.setDialogTitle("Папка для сохранения слоёв")
         form.addRow("Папка:", self.folder)
 
         self.format = QComboBox()
@@ -86,10 +101,11 @@ class SaveTempLayersDialog(QDialog):
         root.addLayout(form)
 
         # --- список слоёв
-        box = QGroupBox("Временные слои проекта")
+        box = self.layers_box = QGroupBox()
         box_layout = QVBoxLayout(box)
         self.layers = QListWidget()
         self.layers.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.layers.setMinimumHeight(200)  # в режиме «все слои» список бывает длинным
         box_layout.addWidget(self.layers)
         row = QHBoxLayout()
         self.btn_all = QPushButton("Выбрать все")
@@ -104,9 +120,7 @@ class SaveTempLayersDialog(QDialog):
         root.addWidget(box)
 
         # --- параметры
-        self.replace = QCheckBox("Заменить временные слои в проекте сохранёнными")
-        self.replace.setToolTip("Слои проекта переключатся на сохранённые файлы и перестанут "
-                                "быть временными. Стиль, порядок и связи сохранятся.")
+        self.replace = QCheckBox()
         self.styles = QCheckBox("Сохранить стили слоёв")
         self.styles.setToolTip("Файл .qml рядом с данными или стиль по умолчанию внутри GeoPackage — "
                                "при открытии файла стиль подхватится сам.")
@@ -114,8 +128,9 @@ class SaveTempLayersDialog(QDialog):
         self.overwrite.setToolTip("Если выключено, к имени добавится _2, _3…")
         for w in (self.replace, self.styles, self.overwrite):
             root.addWidget(w)
-        hint = QLabel("Растры сохраняются в GeoTIFF независимо от выбранного формата: "
-                      "без смены СК — копируются как есть, со сменой — перепроецируются.")
+        hint = QLabel("Растры сохраняются отдельными файлами независимо от выбранного формата: "
+                      "без смены СК — копируются как есть (VRT и растры из баз — в GeoTIFF), "
+                      "со сменой — перепроецируются в GeoTIFF.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray;")
         root.addWidget(hint)
@@ -145,6 +160,8 @@ class SaveTempLayersDialog(QDialog):
 
         self._load_settings()
         self._format_changed()
+        self._apply_mode()
+        self.mode_all.toggled.connect(self._mode_changed)
         self.refresh()
 
     # ------------------------------------------------------------ настройки
@@ -154,10 +171,17 @@ class SaveTempLayersDialog(QDialog):
         if not folder and self.project.absolutePath():
             folder = self.project.absolutePath()
         self.folder.setFilePath(folder or "")
-        idx = self.format.findData(s.value(SETTINGS + "format", "gpkg_single"))
+        # ключ «output_format», а не прежний «format»: с версии 1.2.0 по умолчанию
+        # файл на каждый слой, и старый сохранённый выбор сбрасывается один раз
+        idx = self.format.findData(s.value(SETTINGS + "output_format", saver.FORMATS[0]["key"]))
         self.format.setCurrentIndex(max(idx, 0))
         self.gpkg_name.setText(s.value(SETTINGS + "gpkg_name", "temporary_layers"))
-        self.replace.setChecked(_bool(s.value(SETTINGS + "replace"), True))
+        # «Заменить в проекте» помним отдельно для каждого режима: для постоянных
+        # слоёв по умолчанию выключено — проект остаётся на исходных данных
+        self._replace = {MODE_TEMP: _bool(s.value(SETTINGS + "replace"), True),
+                         MODE_ALL: _bool(s.value(SETTINGS + "replace_all"), False)}
+        self._mode = MODE_ALL if s.value(SETTINGS + "mode", MODE_TEMP) == MODE_ALL else MODE_TEMP
+        (self.mode_all if self._mode == MODE_ALL else self.mode_temp).setChecked(True)
         self.styles.setChecked(_bool(s.value(SETTINGS + "styles"), True))
         self.overwrite.setChecked(_bool(s.value(SETTINGS + "overwrite"), False))
         crs = QgsCoordinateReferenceSystem()
@@ -171,31 +195,62 @@ class SaveTempLayersDialog(QDialog):
     def _save_settings(self):
         s = QgsSettings()
         s.setValue(SETTINGS + "folder", self.folder.filePath())
-        s.setValue(SETTINGS + "format", self.format.currentData())
+        s.setValue(SETTINGS + "output_format", self.format.currentData())
+        s.remove(SETTINGS + "format")
         s.setValue(SETTINGS + "gpkg_name", self.gpkg_name.text())
-        s.setValue(SETTINGS + "replace", self.replace.isChecked())
+        self._replace[self._mode] = self.replace.isChecked()
+        s.setValue(SETTINGS + "mode", self._mode)
+        s.setValue(SETTINGS + "replace", self._replace[MODE_TEMP])
+        s.setValue(SETTINGS + "replace_all", self._replace[MODE_ALL])
         s.setValue(SETTINGS + "styles", self.styles.isChecked())
         s.setValue(SETTINGS + "overwrite", self.overwrite.isChecked())
         crs = self.crs.crs()
         s.setValue(SETTINGS + "crs_authid", crs.authid() if crs.isValid() else "")
         s.setValue(SETTINGS + "crs_wkt", crs.toWkt() if crs.isValid() else "")
 
+    # ------------------------------------------------------------ режим
+    def _apply_mode(self):
+        text, tip = REPLACE_TEXT[self._mode]
+        self.replace.setText(text)
+        self.replace.setToolTip(tip)
+        self.replace.setChecked(self._replace[self._mode])
+        self.layers_box.setTitle("Слои проекта" if self._mode == MODE_ALL else "Временные слои проекта")
+
+    def _mode_changed(self, *_):
+        self._replace[self._mode] = self.replace.isChecked()
+        self._mode = MODE_ALL if self.mode_all.isChecked() else MODE_TEMP
+        self._apply_mode()
+        self.refresh()
+
+    def _find(self):
+        return saver.find_layers(self.project, temporary_only=self._mode == MODE_TEMP)
+
     # ------------------------------------------------------------ список
+    def _add_item(self, layer, text, fmt="{}   ({})"):
+        item = QListWidgetItem(fmt.format(layer.name(), text))
+        try:
+            item.setIcon(QgsIconUtils.iconForLayer(layer))
+        except Exception:
+            pass
+        self.layers.addItem(item)
+        return item
+
     def refresh(self):
         self.layers.blockSignals(True)
         self.layers.clear()
-        for layer, kind in saver.find_temporary_layers(self.project):
-            item = QListWidgetItem("{}   ({})".format(layer.name(), KIND_LABELS[kind]))
-            try:
-                item.setIcon(QgsIconUtils.iconForLayer(layer))
-            except Exception:
-                pass
+        items, skipped = self._find()
+        for layer, kind, temporary in items:
+            item = self._add_item(layer, saver.describe(layer, kind, temporary))
             item.setData(ROLE_ID, layer.id())
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(CHECKED)
-            self.layers.addItem(item)
+        for layer, reason in skipped:  # видно, но выбрать нельзя
+            item = self._add_item(layer, reason, "{}   — {}")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            item.setToolTip(reason)
         if self.layers.count() == 0:
-            item = QListWidgetItem("В проекте нет временных слоёв")
+            item = QListWidgetItem("В проекте нет слоёв" if self._mode == MODE_ALL
+                                   else "В проекте нет временных слоёв")
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             self.layers.addItem(item)
         self.layers.blockSignals(False)
@@ -224,7 +279,7 @@ class SaveTempLayersDialog(QDialog):
 
     # ------------------------------------------------------------ сохранение
     def _selected(self):
-        by_id = {l.id(): (l, k) for l, k in saver.find_temporary_layers(self.project)}
+        by_id = {item[0].id(): item for item in self._find()[0]}
         return [by_id[it.data(ROLE_ID)] for it in self._items()
                 if it.checkState() == CHECKED and it.data(ROLE_ID) in by_id]
 
@@ -310,7 +365,8 @@ class SaveTempLayersDialog(QDialog):
                 "Не забудьте сохранить проект.")
 
     def _set_controls_enabled(self, enabled):
-        for w in (self.folder, self.format, self.crs, self.gpkg_name, self.layers, self.btn_all,
+        for w in (self.mode_temp, self.mode_all, self.folder, self.format, self.crs,
+                  self.gpkg_name, self.layers, self.btn_all,
                   self.btn_none, self.btn_refresh, self.replace, self.styles,
                   self.overwrite, self.btn_save):
             w.setEnabled(enabled)

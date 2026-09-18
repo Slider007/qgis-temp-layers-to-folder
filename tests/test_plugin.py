@@ -34,7 +34,7 @@ from qgis.core import (  # noqa: E402
     QgsRasterLayer,
     QgsVectorLayer,
 )
-from qgis.PyQt.QtCore import QMetaType  # noqa: E402
+from qgis.PyQt.QtCore import QEvent, QMetaType  # noqa: E402
 from qgis.PyQt.QtGui import QColor  # noqa: E402
 
 app = QgsApplication([], True, PROFILE)
@@ -118,7 +118,7 @@ def make_project():
 
 
 def by_name(items, name):
-    return [l for l, _ in items if l.name() == name]
+    return [l for l, *_ in items if l.name() == name]
 
 
 def save(fmt, sub, **kw):
@@ -133,7 +133,7 @@ def save(fmt, sub, **kw):
 
 def test_find():
     p = make_project()
-    kinds = sorted((l.name(), k) for l, k in saver.find_temporary_layers(p))
+    kinds = sorted((l.name(), k) for l, k, _ in saver.find_temporary_layers(p))
     assert kinds == sorted([("Точки: скважины/2", "memory"), ("Участки", "memory"),
                             ("Участки", "memory"), ("Таблица", "memory"),
                             ("Уклон", "raster")]), kinds
@@ -142,7 +142,7 @@ def test_find():
 def check_saved(p, items, res, provider_ok=("ogr", "gdal")):
     bad = [r for r in res if not r["ok"]]
     assert not bad, bad
-    for l, _ in items:
+    for l, *_ in items:
         assert l.isValid() and l.providerType() in provider_ok, (l.name(), l.providerType())
     assert saver.find_temporary_layers(p) == [], "остались временные слои"
     pts = by_name(items, "Точки: скважины/2")[0]
@@ -195,7 +195,7 @@ def test_geojson():
 def test_crs_epsg():
     p, items, folder, res = save("gpkg_single", "crs_utm", crs=UTM37)
     check_saved(p, items, res)
-    for l, _ in items:
+    for l, *_ in items:
         if l.isSpatial():
             assert l.crs() == UTM37, (l.name(), l.crs().authid())
     pt = next(by_name(items, "Точки: скважины/2")[0].getFeatures()).geometry().asPoint()
@@ -207,7 +207,7 @@ def test_crs_epsg():
 def test_crs_user_msk():
     p, items, folder, res = save("shp", "crs_msk", crs=MSK)
     check_saved(p, items, res)
-    for l, _ in items:
+    for l, *_ in items:
         if l.isSpatial():
             assert l.crs() == MSK and l.crs().description() == "МСК (тест)", l.crs().description()
 
@@ -217,6 +217,111 @@ def test_crs_not_set():
     check_saved(p, items, res)
     assert by_name(items, "Точки: скважины/2")[0].crs().authid() == "EPSG:4326"
     assert by_name(items, "Уклон")[0].width() == 20  # растр скопирован, не перепроецирован
+
+
+def make_permanent_sources():
+    """Постоянные данные на диске: GeoJSON с точками и растр VRT поверх GeoTIFF."""
+    src = os.path.join(OUT, "src")
+    os.makedirs(src, exist_ok=True)
+    gj = os.path.join(src, "Опоры.geojson")
+    with open(gj, "w") as fh:
+        fh.write('{"type":"FeatureCollection","features":['
+                 '{"type":"Feature","properties":{"n":1},"geometry":{"type":"Point","coordinates":[39.1,48.5]}},'
+                 '{"type":"Feature","properties":{"n":2},"geometry":{"type":"Point","coordinates":[39.2,48.6]}}]}')
+    tif = os.path.join(src, "dem.tif")
+    ds = gdal.GetDriverByName("GTiff").Create(tif, 10, 10, 1, gdal.GDT_Int16)
+    ds.SetGeoTransform([39.0, 0.01, 0, 48.8, 0, -0.01])
+    sr = osr.SpatialReference()
+    sr.ImportFromEPSG(4326)
+    ds.SetProjection(sr.ExportToWkt())
+    ds.GetRasterBand(1).Fill(120)
+    ds = None
+    vrt = os.path.join(src, "dem.vrt")
+    gdal.BuildVRT(vrt, [tif]).FlushCache()
+    return src, gj, vrt
+
+
+def all_layers_project():
+    p = QgsProject.instance()
+    p.clear()
+    src, gj, vrt = make_permanent_sources()
+    pts = QgsVectorLayer(gj, "Опоры", "ogr")
+    dem = QgsRasterLayer(vrt, "Рельеф", "gdal")
+    mem = QgsVectorLayer("Point?crs=EPSG:4326", "Черновик", "memory")
+    p.addMapLayers([pts, dem, mem])
+    try:
+        from qgis.core import QgsVectorTileLayer
+        vt = QgsVectorTileLayer("type=xyz&url=http://localhost/{z}/{x}/{y}.pbf&zmin=0&zmax=14", "Тайлы")
+        p.addMapLayer(vt)
+    except ImportError:
+        pass
+    return p, src, gj, pts, dem, mem
+
+
+def test_all_layers_mode():
+    p, src, gj, pts, dem, mem = all_layers_project()
+    items, skipped = saver.find_layers(p, temporary_only=False)
+    assert [(l.name(), k, t) for l, k, t in items] == [
+        ("Опоры", "vector", False), ("Рельеф", "raster", False), ("Черновик", "memory", True)], items
+    assert [l.name() for l, _ in skipped] == ["Тайлы"] and "тайлы" in skipped[0][1], skipped
+    assert [l.name() for l, *_ in saver.find_layers(p, temporary_only=True)[0]] == ["Черновик"]
+    assert saver.describe(pts, "vector", False) == "файл .geojson"
+
+    # несохранённая правка в постоянном слое попадает только в копию
+    pts.startEditing()
+    f = QgsFeature(pts.fields())
+    f.setAttributes([3])
+    f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(39.3, 48.7)))
+    pts.addFeature(f)
+    before = open(gj, encoding="utf-8").read()
+
+    folder = os.path.join(OUT, "all_utm")
+    res = saver.save_layers(p, items, folder, "gpkg", crs=UTM37, replace=False)
+    assert all(r["ok"] for r in res), res
+    assert open(gj, encoding="utf-8").read() == before, "исходный файл изменён"
+    assert pts.isEditable() and pts.isModified() and pts.providerType() == "ogr" and pts.source() == gj
+    assert "в исходные данные не записаны" in res[0]["message"]
+    copy = QgsVectorLayer(os.path.join(folder, "Опоры.gpkg"), "x", "ogr")
+    assert copy.featureCount() == 3 and copy.crs() == UTM37
+    info = gdal.Info(os.path.join(folder, "Рельеф.tif"), format="json")
+    assert "37N" in info["coordinateSystem"]["wkt"], "растр не перепроецирован"
+    assert dem.source() == os.path.join(src, "dem.vrt"), "без замены проект не должен меняться"
+    pts.rollBack()
+
+
+def test_all_layers_vrt_without_crs():
+    p, src, gj, pts, dem, mem = all_layers_project()
+    folder = os.path.join(OUT, "all_plain")
+    res = saver.save_layers(p, [(dem, "raster", False)], folder, "gpkg", replace=False)
+    assert res[0]["ok"] and res[0]["path"].endswith("Рельеф.tif"), res  # VRT → GeoTIFF, а не копия .vrt
+    assert gdal.Info(res[0]["path"], format="json")["bands"][0]["type"] == "Int16"
+
+
+def test_source_protection():
+    """Запись в папку с исходниками и перезапись не затирают файлы, из которых читают слои."""
+    p, src, gj, pts, dem, mem = all_layers_project()
+    before = open(gj, encoding="utf-8").read()
+    items = [(pts, "vector", False)]
+    res = saver.save_layers(p, items, src, "geojson", overwrite=True, replace=False)
+    assert res[0]["ok"] and res[0]["path"].endswith("Опоры_2.geojson"), res
+    assert open(gj, encoding="utf-8").read() == before
+    # GeoPackage, из которого читает слой проекта: его таблица не перезаписывается
+    folder = os.path.join(OUT, "protect_gpkg")
+    res = saver.save_layers(p, items, folder, "gpkg_single", gpkg_name="data", replace=True)
+    assert pts.source().endswith("data.gpkg|layername=Опоры"), pts.source()
+    res = saver.save_layers(p, items, folder, "gpkg_single", gpkg_name="data", overwrite=True, replace=False)
+    assert res[0]["path"].endswith("→ Опоры_2"), res
+    assert pts.featureCount() == 2
+
+
+def test_all_layers_replace():
+    p, src, gj, pts, dem, mem = all_layers_project()
+    items, _ = saver.find_layers(p, temporary_only=False)
+    res = saver.save_layers(p, items, os.path.join(OUT, "all_replace"), "gpkg", crs=UTM37, replace=True)
+    assert all(r["ok"] for r in res), res
+    for layer in (pts, dem, mem):
+        assert layer.isValid() and layer.crs() == UTM37 and "all_replace" in layer.source(), layer.source()
+    assert os.path.exists(gj), "исходный файл должен остаться на месте"
 
 
 def test_joins_relations_expressions():
@@ -271,6 +376,47 @@ def test_joins_relations_expressions():
     assert "Заметки_note" not in saved.fields().names() and "id10" not in saved.fields().names()
 
 
+def test_toolbar_buttons():
+    """Своя панель и кнопка на панели «Слои» появляются по одной и убираются при выгрузке."""
+    from qgis.PyQt.QtWidgets import QDockWidget, QMainWindow, QToolBar
+
+    import temp_layers_to_folder
+
+    win = QMainWindow()
+    dock = QDockWidget("Слои", win)
+    dock.setObjectName("Layers")
+    bar = QToolBar(dock)
+    bar.addAction("Развернуть все")
+    dock.setWidget(bar)
+
+    class Iface:
+        def mainWindow(self): return win
+        def layerTreeView(self): return None
+        def addPluginToMenu(self, m, a): pass
+        def removePluginMenu(self, m, a): pass
+
+        def addToolBar(self, name):
+            return win.addToolBar(name)
+
+    def own_toolbars():
+        return [t for t in win.findChildren(QToolBar) if t.objectName() == "TempLayersToFolderToolbar"]
+
+    for _ in range(2):  # повторная загрузка не должна дублировать кнопки
+        plugin = temp_layers_to_folder.classFactory(Iface())
+        plugin.initGui()
+        texts = [a.text() for a in bar.actions()]
+        assert texts[-1] == "Сохранить временные слои…" and texts.count(texts[-1]) == 1, texts
+        assert bar.actions()[-2].isSeparator()
+        own = own_toolbars()
+        assert len(own) == 1 and own[0].windowTitle() == "Временные слои", own
+        assert [a.text() for a in own[0].actions()] == ["Сохранить временные слои…"]
+        assert own[0].isMovable()
+        plugin.unload()
+        QgsApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)  # выполнить deleteLater
+        assert [a.text() for a in bar.actions()] == ["Развернуть все"], [a.text() for a in bar.actions()]
+        assert own_toolbars() == []
+
+
 def test_dialog():
     from qgis.PyQt.QtWidgets import QMainWindow, QMessageBox
 
@@ -293,10 +439,14 @@ def test_dialog():
         def messageBar(self):
             return self.bar
 
-        def addToolBarIcon(self, a): pass
+        def layerTreeView(self):
+            return None
+
+        def addToolBar(self, name):
+            return self.w.addToolBar(name)
+
         def addPluginToMenu(self, m, a): pass
         def removePluginMenu(self, m, a): pass
-        def removeToolBarIcon(self, a): pass
 
     make_project()
     iface = Iface()
@@ -305,12 +455,19 @@ def test_dialog():
     d = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
     d.folder.setFilePath(os.path.join(OUT, "dialog"))
     d.crs.setCrs(UTM37)
+    d.mode_all.setChecked(True)  # «все слои»: к пяти временным добавляется постоянный «Постоянный»
+    assert d.layers_box.title() == "Слои проекта" and not d.replace.isChecked()
+    assert [it.text().split("   ")[0] for it in d._items()][-1] == "Постоянный"
+    assert len(list(d._items())) == 6
+    d.mode_temp.setChecked(True)
+    assert d.replace.isChecked()
     items = list(d._items())
     assert len(items) == 5
     items[0].setCheckState(dlg_mod.UNCHECKED)
     if os.environ.get("SCREENSHOT"):  # снимок окна для README
         d.folder.setFilePath("/Users/me/Documents/Проект/data")
-        d.resize(620, 560)
+        d.crs.setCrs(QgsCoordinateReferenceSystem("EPSG:32637"))
+        d.resize(620, 700)
         d.show()
         QgsApplication.processEvents()
         d.grab().save(os.environ["SCREENSHOT"])

@@ -1,4 +1,4 @@
-"""Поиск и сохранение временных слоёв проекта QGIS (без зависимостей от интерфейса)."""
+"""Поиск и сохранение слоёв проекта QGIS (без зависимостей от интерфейса)."""
 
 import os
 import re
@@ -41,11 +41,11 @@ except AttributeError:
                        _enum(QgsFields, "FieldOrigin", "OriginExpression"))
 
 
-FORMATS = [
-    {"key": "gpkg_single", "label": "GeoPackage — все слои в одном файле",
-     "driver": "GPKG", "ext": "gpkg", "single": True},
+FORMATS = [  # первый — формат по умолчанию
     {"key": "gpkg", "label": "GeoPackage — отдельный файл на каждый слой",
      "driver": "GPKG", "ext": "gpkg", "single": False},
+    {"key": "gpkg_single", "label": "GeoPackage — все слои в одном файле",
+     "driver": "GPKG", "ext": "gpkg", "single": True},
     {"key": "shp", "label": "ESRI Shapefile",
      "driver": "ESRI Shapefile", "ext": "shp", "single": False},
     {"key": "geojson", "label": "GeoJSON",
@@ -93,44 +93,100 @@ def _inside(path, folder):
         return False
 
 
-def temp_kind(layer, processing_dir=None):
-    """'memory', 'vector' или 'raster' для временного слоя, иначе None."""
+def _is_temporary(layer, processing_dir):
+    try:
+        if layer.isTemporary():
+            return True
+    except Exception:  # noqa: BLE001 — нет метода в старых версиях
+        pass
+    return _inside(layer_path(layer), processing_dir)
+
+
+_ONLINE_PROVIDERS = {"wms": "WMS/XYZ", "wcs": "WCS", "arcgismapserver": "ArcGIS"}
+
+_UNSUPPORTED_TYPES = {
+    "QgsMeshLayer": "сетка (mesh) — сохранить нельзя",
+    "QgsPointCloudLayer": "облако точек — сохранить нельзя",
+    "QgsVectorTileLayer": "векторные тайлы — сохранить нельзя",
+    "QgsTiledSceneLayer": "3D-сцена — сохранить нельзя",
+}
+
+
+def classify(layer, processing_dir=None):
+    """(kind, temporary, reason): kind — 'memory', 'vector' или 'raster';
+    если слой сохранить нельзя, kind = None, а reason объясняет почему."""
     if processing_dir is None:
         processing_dir = _processing_temp_dir()
-
     if isinstance(layer, QgsVectorLayer):
         if layer.providerType() == "memory":
-            return "memory"
-    elif not isinstance(layer, QgsRasterLayer):
-        return None  # меш, облака точек, векторные тайлы — не поддерживаются
-
-    is_temp = False
-    if hasattr(layer, "isTemporary"):
-        try:
-            is_temp = layer.isTemporary()
-        except Exception:
-            is_temp = False
-    path = layer_path(layer)
-    if not is_temp:
-        is_temp = _inside(path, processing_dir)
-    if not is_temp or not path:
-        return None
-    return "vector" if isinstance(layer, QgsVectorLayer) else "raster"
+            return "memory", True, ""
+        if not layer.isValid():
+            return None, False, "слой недоступен — источник не найден"
+        return "vector", _is_temporary(layer, processing_dir), ""
+    if isinstance(layer, QgsRasterLayer):
+        if not layer.isValid():
+            return None, False, "слой недоступен — источник не найден"
+        if layer.providerType() != "gdal":
+            prov = _ONLINE_PROVIDERS.get(layer.providerType(), layer.providerType().upper())
+            return None, False, "онлайн-слой {} — сохранить нельзя".format(prov)
+        return "raster", _is_temporary(layer, processing_dir), ""
+    return None, False, _UNSUPPORTED_TYPES.get(type(layer).__name__, "этот тип слоя не поддерживается")
 
 
-def find_temporary_layers(project):
-    """Список (layer, kind) в порядке панели «Слои»."""
+def find_layers(project, temporary_only=True):
+    """Слои проекта в порядке панели «Слои».
+
+    Возвращает (items, skipped): items = [(layer, kind, temporary)] — что можно
+    сохранить; skipped = [(layer, причина)] — что сохранить нельзя (только для
+    режима «все слои»).
+    """
     processing_dir = _processing_temp_dir()
     ordered = [n.layer() for n in project.layerTreeRoot().findLayers() if n.layer()]
     seen = {l.id() for l in ordered}
     ordered += [l for l in project.mapLayers().values() if l.id() not in seen]
 
-    result = []
+    items, skipped = [], []
     for layer in ordered:
-        kind = temp_kind(layer, processing_dir)
-        if kind:
-            result.append((layer, kind))
-    return result
+        kind, temporary, reason = classify(layer, processing_dir)
+        if temporary_only:
+            if kind and temporary:
+                items.append((layer, kind, temporary))
+        elif kind:
+            items.append((layer, kind, temporary))
+        else:
+            skipped.append((layer, reason))
+    return items, skipped
+
+
+def find_temporary_layers(project):
+    """[(layer, kind, True)] — временные слои проекта."""
+    return find_layers(project, temporary_only=True)[0]
+
+
+_PROVIDER_LABELS = {
+    "postgres": "PostGIS", "spatialite": "SpatiaLite", "wfs": "WFS", "oapif": "WFS",
+    "delimitedtext": "CSV", "virtual": "виртуальный слой", "mssql": "MS SQL",
+    "oracle": "Oracle", "arcgisfeatureserver": "ArcGIS", "gpx": "GPX",
+}
+
+
+def describe(layer, kind, temporary):
+    """Короткая подпись источника для списка слоёв."""
+    if kind == "memory":
+        return "в памяти"
+    if temporary:
+        return "временный растр" if kind == "raster" else "временный файл"
+    ext = os.path.splitext(layer_path(layer))[1].lower()
+    if kind == "raster":
+        return "растр " + ext if ext else "растр"
+    if layer.providerType() == "ogr":
+        return "файл " + ext if ext else "файл"
+    return _PROVIDER_LABELS.get(layer.providerType(), layer.providerType())
+
+
+def _source_files(project):
+    """Файлы, из которых читают слои проекта, — их нельзя перезаписывать."""
+    return {os.path.realpath(p) for p in (layer_path(l) for l in project.mapLayers().values()) if p}
 
 
 # ---------------------------------------------------------------- имена
@@ -215,20 +271,33 @@ def _write_vector(layer, path, driver, layer_name, action, transform_context, ct
     return new_file, new_layer
 
 
-def _raster_stem(dest_folder, base, ext, overwrite, taken):
+def _raster_stem(dest_folder, base, ext, overwrite, taken, protected):
     def is_taken(name):
         if name.lower() in taken:
             return True
-        return not overwrite and os.path.exists(os.path.join(dest_folder, name + ext))
+        path = os.path.join(dest_folder, name + ext)
+        if os.path.realpath(path) in protected:
+            return True  # из этого файла читает слой проекта
+        return not overwrite and os.path.exists(path)
 
     return _unique(base, is_taken)
 
 
-def _copy_raster(src, dest_folder, base, overwrite, taken):
+# Форматы, которые безопасно копировать файлом (со «спутниками» по имени).
+# Остальное (VRT, растр внутри GeoPackage, NetCDF, архивы) переводим в GeoTIFF.
+_COPYABLE_RASTERS = {".tif", ".tiff", ".img", ".asc", ".jp2", ".ecw", ".sdat",
+                     ".bil", ".png", ".jpg", ".jpeg", ".gif", ".bmp"}
+
+
+def _gdal_source(layer):
+    return layer.source().split("|")[0]
+
+
+def _copy_raster(src, dest_folder, base, overwrite, taken, protected):
     """Копирует растр со всеми «спутниками» (.aux.xml, .ovr, .tfw, .prj…)."""
     src_dir, src_file = os.path.split(src)
     src_stem, ext = os.path.splitext(src_file)
-    stem = _raster_stem(dest_folder, base, ext, overwrite, taken)
+    stem = _raster_stem(dest_folder, base, ext, overwrite, taken, protected)
     for name in os.listdir(src_dir):
         if name == src_file or name.startswith(src_file + "."):
             new_name = stem + ext + name[len(src_file):]
@@ -242,27 +311,36 @@ def _copy_raster(src, dest_folder, base, overwrite, taken):
     return os.path.join(dest_folder, stem + ext), stem
 
 
-def _warp_raster(src, dest_folder, base, overwrite, taken, crs):
-    """Перепроецирует растр в GeoTIFF (ресемплинг — ближайший сосед)."""
+def _gdal_to_geotiff(src, dest_folder, base, overwrite, taken, protected, crs=None):
+    """Пишет растр в GeoTIFF через GDAL: перепроецирует (crs задана) или просто
+    переводит формат. Ресемплинг — ближайший сосед."""
     from osgeo import gdal
 
-    stem = _raster_stem(dest_folder, base, ".tif", overwrite, taken)
+    stem = _raster_stem(dest_folder, base, ".tif", overwrite, taken, protected)
     dest = os.path.join(dest_folder, stem + ".tif")
     # gdal.Warp в существующий файл дописывает в него, а не заменяет — удаляем заранее
     for old in (dest, dest + ".aux.xml", dest + ".ovr"):
         if os.path.exists(old):
             os.remove(old)
-    options = gdal.WarpOptions(
-        format="GTiff",
-        dstSRS=crs.toWkt(WKT_GDAL),
-        resampleAlg="near",
-        creationOptions=["COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=IF_SAFER"],
-    )
-    ds = gdal.Warp(dest, src, options=options)
+    creation = ["COMPRESS=DEFLATE", "TILED=YES", "BIGTIFF=IF_SAFER"]
+    if crs is not None:
+        ds = gdal.Warp(dest, src, options=gdal.WarpOptions(
+            format="GTiff", dstSRS=crs.toWkt(WKT_GDAL), resampleAlg="near", creationOptions=creation))
+    else:
+        ds = gdal.Translate(dest, src, options=gdal.TranslateOptions(format="GTiff", creationOptions=creation))
     if ds is None:
-        raise RuntimeError("GDAL: " + (gdal.GetLastErrorMsg() or "не удалось перепроецировать растр"))
+        raise RuntimeError("GDAL: " + (gdal.GetLastErrorMsg() or "не удалось записать растр"))
     ds = None
     return dest, stem
+
+
+def _save_raster(layer, folder, base, overwrite, taken, protected, crs):
+    src = _gdal_source(layer)
+    path = layer_path(layer)
+    if crs is None and path and os.path.realpath(path) == os.path.realpath(src) \
+            and os.path.splitext(path)[1].lower() in _COPYABLE_RASTERS:
+        return _copy_raster(path, folder, base, overwrite, taken, protected)
+    return _gdal_to_geotiff(src, folder, base, overwrite, taken, protected, crs)
 
 
 def _crs_label(crs):
@@ -314,9 +392,12 @@ def _repoint(layer, uri, provider, project, crs=None):
 def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 replace=True, save_styles=True, overwrite=False, crs=None,
                 progress=None, is_cancelled=None):
-    """Сохраняет слои items = [(layer, kind), ...] в папку folder.
+    """Сохраняет слои items = [(layer, kind, temporary), ...] в папку folder.
 
     crs — система координат для сохранения; None / недействительная — как у слоя.
+    Исходные данные постоянных слоёв не меняются: правки из режима
+    редактирования попадают только в копию, а файлы, из которых читают слои
+    проекта, не перезаписываются даже при overwrite=True.
 
     Возвращает список словарей {"name", "ok", "path", "message"}.
     """
@@ -324,6 +405,7 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
     driver, ext = fmt["driver"], fmt["ext"]
     os.makedirs(folder, exist_ok=True)
     tc = project.transformContext()
+    protected = _source_files(project)
 
     single_path = ""
     taken = set()  # занятые в этом запуске имена (в нижнем регистре)
@@ -332,12 +414,13 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
         if not gpkg_file.lower().endswith(".gpkg"):
             gpkg_file += ".gpkg"
         single_path = os.path.join(folder, gpkg_file)
-        if not overwrite:
+        if not overwrite or os.path.realpath(single_path) in protected:
+            # в этот GeoPackage смотрят слои проекта — его таблицы не трогаем
             taken |= _existing_gpkg_layers(single_path)
 
     results = []
     total = len(items)
-    for i, (layer, kind) in enumerate(items):
+    for i, (layer, kind, temporary) in enumerate(items):
         if is_cancelled and is_cancelled():
             raise Cancelled()
         name = layer.name()
@@ -346,25 +429,32 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
         base = safe_name(name)
         res = {"name": name, "ok": False, "path": "", "message": ""}
         notes = []
+        can_repoint = replace
         try:
             if isinstance(layer, QgsVectorLayer) and layer.isEditable():
-                if not layer.commitChanges():
-                    raise RuntimeError("не удалось завершить редактирование: "
-                                       + "; ".join(layer.commitErrors()))
-                notes.append("правки слоя были применены")
+                if temporary:
+                    if not layer.commitChanges():
+                        raise RuntimeError("не удалось завершить редактирование: "
+                                           + "; ".join(layer.commitErrors()))
+                    notes.append("правки слоя были применены")
+                elif layer.isModified():
+                    # исходные данные не трогаем: правки попадут только в копию
+                    notes.append("несохранённые правки попали в копию, в исходные данные не записаны")
+                    if replace:
+                        can_repoint = False
+                        notes.append("слой в режиме редактирования — в проекте не переключён")
+                elif replace:
+                    layer.rollBack()  # правок нет — выходим из редактирования, чтобы переключить слой
 
             target = _target_crs(layer, crs, notes)
             ct = QgsCoordinateTransform(layer.crs(), target, tc) if target else None
 
             if kind == "raster":
-                if target:
-                    path, stem = _warp_raster(layer_path(layer), folder, base, overwrite, taken, target)
-                else:
-                    path, stem = _copy_raster(layer_path(layer), folder, base, overwrite, taken)
+                path, stem = _save_raster(layer, folder, base, overwrite, taken, protected, target)
                 taken.add(stem.lower())
                 if save_styles:
                     layer.saveNamedStyle(os.path.splitext(path)[0] + ".qml")
-                if replace and not _repoint(layer, path, "gdal", project, target):
+                if can_repoint and not _repoint(layer, path, "gdal", project, target):
                     raise RuntimeError("файл сохранён, но слой не удалось переключить на него")
                 res.update(ok=True, path=path)
 
@@ -373,7 +463,7 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 taken.add(layer_name.lower())
                 action = CREATE_LAYER if os.path.exists(single_path) else CREATE_FILE
                 new_file, new_layer = _write_vector(layer, single_path, driver, layer_name, action, tc, ct,
-                                                    own_fields_only=replace)
+                                                    own_fields_only=can_repoint)
                 uri = "{}|layername={}".format(new_file, new_layer)
                 if save_styles:
                     try:
@@ -382,24 +472,26 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                         err = str(e)
                     if err:
                         notes.append("стиль не сохранён: " + err)
-                if replace and not _repoint(layer, uri, "ogr", project, target):
+                if can_repoint and not _repoint(layer, uri, "ogr", project, target):
                     raise RuntimeError("данные сохранены, но слой не удалось переключить на них")
                 res.update(ok=True, path="{} → {}".format(new_file, new_layer))
 
             else:
+                parts = _SHP_PARTS if driver == "ESRI Shapefile" else ("." + ext,)
+
                 def is_taken(c):
                     if c.lower() in taken:
                         return True
-                    if overwrite:
-                        return False
-                    parts = _SHP_PARTS if driver == "ESRI Shapefile" else ("." + ext,)
-                    return any(os.path.exists(os.path.join(folder, c + p)) for p in parts)
+                    paths = [os.path.join(folder, c + p) for p in parts]
+                    if any(os.path.realpath(p) in protected for p in paths):
+                        return True  # из этого файла читает слой проекта
+                    return not overwrite and any(os.path.exists(p) for p in paths)
 
                 stem = _unique(base, is_taken)
                 taken.add(stem.lower())
                 path = os.path.join(folder, stem + "." + ext)
                 new_file, new_layer = _write_vector(layer, path, driver, stem, CREATE_FILE, tc, ct,
-                                                    own_fields_only=replace)
+                                                    own_fields_only=can_repoint)
                 if not os.path.exists(new_file):
                     # Shapefile без геометрии записывается только как .dbf
                     dbf = os.path.splitext(new_file)[0] + ".dbf"
@@ -410,7 +502,7 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                     msg, ok = layer.saveNamedStyle(os.path.splitext(new_file)[0] + ".qml")
                     if not ok:
                         notes.append("стиль не сохранён: " + msg)
-                if replace and not _repoint(layer, uri, "ogr", project, target):
+                if can_repoint and not _repoint(layer, uri, "ogr", project, target):
                     raise RuntimeError("файл сохранён, но слой не удалось переключить на него")
                 res.update(ok=True, path=new_file)
 

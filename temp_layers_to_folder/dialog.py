@@ -1,8 +1,10 @@
 import os
 
-from qgis.core import Qgis, QgsCoordinateReferenceSystem, QgsIconUtils, QgsProject, QgsSettings
+from qgis.core import (Qgis, QgsCoordinateReferenceSystem, QgsIconUtils, QgsProject, QgsSettings,
+                       QgsVectorLayer)
 from qgis.gui import QgsFileWidget, QgsProjectionSelectionWidget
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QUrl
+from qgis.PyQt.QtGui import QDesktopServices
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -25,10 +27,12 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
 )
 
-from . import saver
+from . import packager, saver
 
 SETTINGS = "temp_layers_to_folder/"
-MODE_TEMP, MODE_ALL = "temp", "all"
+MODE_TEMP, MODE_ALL, MODE_PACKAGE = "temp", "all", "package"
+BOX_TITLES = {MODE_TEMP: "Временные слои проекта", MODE_ALL: "Слои проекта",
+              MODE_PACKAGE: "Слои для передачи"}
 REPLACE_TEXT = {
     MODE_TEMP: ("Заменить временные слои в проекте сохранёнными",
                 "Слои проекта переключатся на сохранённые файлы и перестанут быть временными. "
@@ -65,20 +69,28 @@ class SaveTempLayersDialog(QDialog):
 
         # --- какие слои, куда и как
         form = QFormLayout()
-        self.mode_temp = QRadioButton("Только временные")
-        self.mode_all = QRadioButton("Все слои проекта")
+        self.mode_temp = QRadioButton("Сохранить только временные слои")
+        self.mode_all = QRadioButton("Сохранить все слои проекта")
         self.mode_all.setToolTip("Например, чтобы сохранить весь проект в новой системе координат. "
                                  "Онлайн-слои (WMS, XYZ) и облака точек сохранить нельзя.")
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(self.mode_temp)
-        mode_row.addWidget(self.mode_all)
-        mode_row.addStretch()
-        form.addRow("Какие слои:", mode_row)
+        self.mode_package = QRadioButton("Собрать проект в data_all и архив")
+        self.mode_package.setToolTip(
+            "1) Слои, свои картинки и свободные шрифты копируются в папку data_all рядом с файлом "
+            "проекта, проект переключается на них и сохраняется — исходные файлы можно удалить.\n"
+            "2) Рядом с проектом появляется архив «<проект>_архив_<дата>.zip»: проект, data_all "
+            "и «Состав.txt».")
+        self._radios = {MODE_TEMP: self.mode_temp, MODE_ALL: self.mode_all,
+                        MODE_PACKAGE: self.mode_package}
+        mode_col = QVBoxLayout()
+        for radio in self._radios.values():
+            mode_col.addWidget(radio)
+        form.addRow("Режим:", mode_col)
 
         self.folder = QgsFileWidget()
         self.folder.setStorageMode(saver._enum(QgsFileWidget, "StorageMode", "GetDirectory"))
-        self.folder.setDialogTitle("Папка для сохранения слоёв")
-        form.addRow("Папка:", self.folder)
+        self.folder.setDialogTitle("Папка для сохранения")
+        self.folder_label = QLabel("Папка:")
+        form.addRow(self.folder_label, self.folder)
 
         self.format = QComboBox()
         for f in saver.FORMATS:
@@ -99,6 +111,11 @@ class SaveTempLayersDialog(QDialog):
         self.gpkg_name_label = QLabel("Имя файла .gpkg:")
         form.addRow(self.gpkg_name_label, self.gpkg_name)
         root.addLayout(form)
+        # отдельной строкой, а не в форме: QFormLayout обрезает переносимый текст
+        self.package_hint = QLabel()
+        self.package_hint.setWordWrap(True)
+        self.package_hint.setStyleSheet("color: gray;")
+        root.addWidget(self.package_hint)
 
         # --- список слоёв
         box = self.layers_box = QGroupBox()
@@ -126,7 +143,11 @@ class SaveTempLayersDialog(QDialog):
                                "при открытии файла стиль подхватится сам.")
         self.overwrite = QCheckBox("Перезаписывать существующие файлы")
         self.overwrite.setToolTip("Если выключено, к имени добавится _2, _3…")
-        for w in (self.replace, self.styles, self.overwrite):
+        self.pkg_fonts = QCheckBox("Скопировать в data_all/fonts шрифты со свободной лицензией")
+        self.pkg_fonts.setToolTip("Шрифты подписей, значков и макетов. Платные и шрифты без указанной "
+                                  "лицензии не копируются — они перечисляются в «Состав.txt».")
+        self._pkg_widgets = (self.pkg_fonts,)
+        for w in (self.replace, self.styles, self.overwrite) + self._pkg_widgets:
             root.addWidget(w)
         hint = QLabel("Растры сохраняются отдельными файлами независимо от выбранного формата: "
                       "без смены СК — копируются как есть (VRT и растры из баз — в GeoTIFF), "
@@ -147,11 +168,20 @@ class SaveTempLayersDialog(QDialog):
         self.buttons = QDialogButtonBox()
         self.btn_save = self.buttons.addButton("Сохранить", QDialogButtonBox.ButtonRole.AcceptRole)
         self.btn_close = self.buttons.addButton("Закрыть", QDialogButtonBox.ButtonRole.RejectRole)
-        root.addWidget(self.buttons)
+        # «Открыть папку» — вне QDialogButtonBox: тот сам показывает все свои кнопки
+        self.btn_open = QPushButton("Открыть папку")
+        self.btn_open.setVisible(False)
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.btn_open)
+        bottom.addWidget(self.buttons, 1)
+        root.addLayout(bottom)
+        self._last_folder = ""
 
         # --- сигналы
         self.btn_save.clicked.connect(self.run)
         self.btn_close.clicked.connect(self.reject)
+        self.btn_open.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(self._last_folder)))
         self.btn_all.clicked.connect(lambda: self._set_all(CHECKED))
         self.btn_none.clicked.connect(lambda: self._set_all(UNCHECKED))
         self.btn_refresh.clicked.connect(self.refresh)
@@ -161,7 +191,8 @@ class SaveTempLayersDialog(QDialog):
         self._load_settings()
         self._format_changed()
         self._apply_mode()
-        self.mode_all.toggled.connect(self._mode_changed)
+        for radio in self._radios.values():
+            radio.toggled.connect(self._mode_changed)
         self.refresh()
 
     # ------------------------------------------------------------ настройки
@@ -180,8 +211,10 @@ class SaveTempLayersDialog(QDialog):
         # слоёв по умолчанию выключено — проект остаётся на исходных данных
         self._replace = {MODE_TEMP: _bool(s.value(SETTINGS + "replace"), True),
                          MODE_ALL: _bool(s.value(SETTINGS + "replace_all"), False)}
-        self._mode = MODE_ALL if s.value(SETTINGS + "mode", MODE_TEMP) == MODE_ALL else MODE_TEMP
-        (self.mode_all if self._mode == MODE_ALL else self.mode_temp).setChecked(True)
+        mode = s.value(SETTINGS + "mode", MODE_TEMP)
+        self._mode = mode if mode in self._radios else MODE_TEMP
+        self._radios[self._mode].setChecked(True)
+        self.pkg_fonts.setChecked(_bool(s.value(SETTINGS + "pkg_fonts"), True))
         self.styles.setChecked(_bool(s.value(SETTINGS + "styles"), True))
         self.overwrite.setChecked(_bool(s.value(SETTINGS + "overwrite"), False))
         crs = QgsCoordinateReferenceSystem()
@@ -198,8 +231,10 @@ class SaveTempLayersDialog(QDialog):
         s.setValue(SETTINGS + "output_format", self.format.currentData())
         s.remove(SETTINGS + "format")
         s.setValue(SETTINGS + "gpkg_name", self.gpkg_name.text())
-        self._replace[self._mode] = self.replace.isChecked()
+        if self._mode in self._replace:
+            self._replace[self._mode] = self.replace.isChecked()
         s.setValue(SETTINGS + "mode", self._mode)
+        s.setValue(SETTINGS + "pkg_fonts", self.pkg_fonts.isChecked())
         s.setValue(SETTINGS + "replace", self._replace[MODE_TEMP])
         s.setValue(SETTINGS + "replace_all", self._replace[MODE_ALL])
         s.setValue(SETTINGS + "styles", self.styles.isChecked())
@@ -210,17 +245,47 @@ class SaveTempLayersDialog(QDialog):
 
     # ------------------------------------------------------------ режим
     def _apply_mode(self):
-        text, tip = REPLACE_TEXT[self._mode]
-        self.replace.setText(text)
-        self.replace.setToolTip(tip)
-        self.replace.setChecked(self._replace[self._mode])
-        self.layers_box.setTitle("Слои проекта" if self._mode == MODE_ALL else "Временные слои проекта")
+        package = self._mode == MODE_PACKAGE
+        if not package:
+            text, tip = REPLACE_TEXT[self._mode]
+            self.replace.setText(text)
+            self.replace.setToolTip(tip)
+            self.replace.setChecked(self._replace[self._mode])
+        # при сборке слои всегда переключаются, а папка — data_all рядом с проектом
+        self.replace.setVisible(not package)
+        self.overwrite.setVisible(not package)
+        self.folder.setVisible(not package)
+        self.folder_label.setVisible(not package)
+        for w in self._pkg_widgets:
+            w.setVisible(package)
+        self.layers_box.setTitle(BOX_TITLES[self._mode])
+        self.btn_save.setText("Собрать" if package else "Сохранить")
+        self._format_changed()
+        self._update_package_hint()
 
     def _mode_changed(self, *_):
-        self._replace[self._mode] = self.replace.isChecked()
-        self._mode = MODE_ALL if self.mode_all.isChecked() else MODE_TEMP
+        mode = next(m for m, radio in self._radios.items() if radio.isChecked())
+        if mode == self._mode:
+            return  # сигнал от кнопки, которую выключили
+        if self._mode in self._replace:
+            self._replace[self._mode] = self.replace.isChecked()
+        self._mode = mode
         self._apply_mode()
         self.refresh()
+
+    def _update_package_hint(self, *_):
+        package = self._mode == MODE_PACKAGE
+        self.package_hint.setVisible(package)
+        if not package:
+            return
+        if not self.project.fileName():
+            self.package_hint.setText("Проект ещё не сохранён — сначала будет предложено сохранить его: "
+                                      "папка data_all и архив появятся рядом с файлом проекта.")
+            return
+        self.package_hint.setText(
+            "Слои скопируются в «{}», проект переключится на них и сохранится. "
+            "Рядом с проектом появится архив «{}.zip».".format(
+                packager.data_dir(self.project), packager.archive_name(self.project)))
 
     def _find(self):
         return saver.find_layers(self.project, temporary_only=self._mode == MODE_TEMP)
@@ -249,8 +314,8 @@ class SaveTempLayersDialog(QDialog):
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             item.setToolTip(reason)
         if self.layers.count() == 0:
-            item = QListWidgetItem("В проекте нет слоёв" if self._mode == MODE_ALL
-                                   else "В проекте нет временных слоёв")
+            item = QListWidgetItem("В проекте нет временных слоёв" if self._mode == MODE_TEMP
+                                   else "В проекте нет слоёв")
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             self.layers.addItem(item)
         self.layers.blockSignals(False)
@@ -273,7 +338,8 @@ class SaveTempLayersDialog(QDialog):
         self.btn_save.setEnabled(checked > 0 and not self._busy)
 
     def _format_changed(self, *_):
-        single = saver.FORMATS_BY_KEY[self.format.currentData()]["single"]
+        # в пакете общий GeoPackage называется по проекту
+        single = saver.FORMATS_BY_KEY[self.format.currentData()]["single"] and self._mode != MODE_PACKAGE
         self.gpkg_name.setVisible(single)
         self.gpkg_name_label.setVisible(single)
 
@@ -290,6 +356,8 @@ class SaveTempLayersDialog(QDialog):
         QApplication.processEvents()
 
     def run(self):
+        if self._mode == MODE_PACKAGE:
+            return self._run_package()
         folder = self.folder.filePath().strip()
         if not folder:
             QMessageBox.warning(self, self.windowTitle(), "Выберите папку для сохранения.")
@@ -308,14 +376,7 @@ class SaveTempLayersDialog(QDialog):
             self.refresh()
             return
 
-        self._save_settings()
-        self._busy = True
-        self._cancel = False
-        self._set_controls_enabled(False)
-        self.progress.setVisible(True)
-        self.log.clear()
-        self.log.setVisible(True)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self._start()
         try:
             results = saver.save_layers(
                 self.project, items, folder, self.format.currentData(),
@@ -334,13 +395,120 @@ class SaveTempLayersDialog(QDialog):
             results = None
             self.log.appendPlainText("Ошибка: {}".format(e))
         finally:
-            QApplication.restoreOverrideCursor()
-            self._busy = False
-            self._set_controls_enabled(True)
+            self._finish()
 
         if results is not None:
             self._report(results, folder)
         self.refresh()
+
+    def _start(self):
+        self._save_settings()
+        self._busy = True
+        self._cancel = False
+        self._set_controls_enabled(False)
+        self.progress.setVisible(True)
+        self.log.clear()
+        self.log.setVisible(True)
+        self.btn_open.setVisible(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+    def _finish(self):
+        QApplication.restoreOverrideCursor()
+        self._busy = False
+        self._set_controls_enabled(True)
+
+    def _run_package(self):
+        items = self._selected()
+        if not items:
+            self.refresh()
+            return
+        if not self._ensure_project_saved():
+            return
+        edited = [l.name() for l, _kind, temporary in items
+                  if isinstance(l, QgsVectorLayer) and not temporary and l.isEditable() and l.isModified()]
+        if edited:
+            QMessageBox.warning(self, self.windowTitle(),
+                                "Сначала сохраните или отмените правки в слоях:\n\n" + "\n".join(edited))
+            return
+        crs = self.crs.crs()
+        text = ("Слои ({}) будут скопированы в папку:\n{}\n\nПроект переключится на эти копии и "
+                "будет сохранён. Исходные файлы не удаляются.").format(
+                    len(items), packager.data_dir(self.project))
+        if crs.isValid():
+            text += "\n\nСистема координат слоёв и проекта: {}.".format(crs.authid() or crs.description())
+        text += "\n\nЗатем рядом с проектом будет собран архив «{}.zip».\n\nПродолжить?".format(
+            packager.archive_name(self.project))
+        if QMessageBox.question(self, self.windowTitle(), text) != QMessageBox.StandardButton.Yes:
+            return
+
+        self._start()
+        result = None
+        try:
+            result = packager.consolidate_project(
+                self.project, items, self.format.currentData(), crs=crs,
+                save_styles=self.styles.isChecked(), include_fonts=self.pkg_fonts.isChecked(),
+                save_project=lambda: self.iface.actionSaveProject().trigger(),
+                progress=self._on_progress, is_cancelled=lambda: self._cancel)
+        except saver.Cancelled:
+            self.log.appendPlainText("Отменено. Часть слоёв могла уже переключиться на data_all — "
+                                     "проект не сохранён, можно закрыть его без сохранения.")
+        except Exception as e:  # noqa: BLE001
+            self.log.appendPlainText("Ошибка: {}".format(e))
+        finally:
+            self._finish()
+        if result is not None:
+            self._report_package(result)
+        self.refresh()
+
+    def _ensure_project_saved(self):
+        """Копия для пакета строится из файла проекта — он должен быть сохранён."""
+        if self.project.fileName() and not self.project.isDirty():
+            return True
+        answer = QMessageBox.question(
+            self, self.windowTitle(),
+            "Пакет собирается из сохранённого файла проекта.\n\nСохранить проект сейчас?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self.iface.actionSaveProject().trigger()
+        if self.project.fileName() and not self.project.isDirty():
+            self._update_package_hint()
+            return True
+        QMessageBox.warning(self, self.windowTitle(), "Проект не сохранён — упаковка отменена.")
+        return False
+
+    def _report_package(self, pkg):
+        folder = os.path.dirname(pkg["zip"])
+        failed = [r for r in pkg["results"] if not r["ok"]]
+        for r in pkg["results"]:
+            line = "{} {}".format("✔" if r["ok"] else "✘", r["name"])
+            if r["ok"]:
+                line += " → " + r["rel"]
+            if r["message"]:
+                line += "  [{}]".format(r["message"])
+            self.log.appendPlainText(line)
+        if pkg["already"]:
+            self.log.appendPlainText("Уже были в data_all: " + ", ".join(pkg["already"]))
+        if pkg["images"]:
+            self.log.appendPlainText("Свои картинки в data_all/images: {}".format(len(pkg["images"])))
+        fonts = pkg["fonts"]
+        if fonts["free"]:
+            self.log.appendPlainText("Шрифты в data_all/fonts: " + ", ".join(sorted(fonts["free"])))
+        if fonts["paid"]:
+            self.log.appendPlainText("Платные шрифты (не вложены): " + ", ".join(fonts["paid"]))
+        if fonts["unknown"]:
+            self.log.appendPlainText("Шрифты без указанной лицензии (не вложены): " + ", ".join(fonts["unknown"]))
+        if fonts["missing"]:
+            self.log.appendPlainText("Не найдены шрифты: " + ", ".join(fonts["missing"]))
+        if pkg["excluded"]:
+            self.log.appendPlainText("Не в data_all и не в архиве: " + ", ".join(pkg["excluded"]))
+        self.log.appendPlainText("\nПроект сохранён, слои — в " + pkg["data_dir"])
+        self.log.appendPlainText("Архив: " + pkg["zip"])
+        self._last_folder = folder
+        self.btn_open.setVisible(True)
+        level = "Success" if not failed else "Warning"
+        self.iface.messageBar().pushMessage(
+            "Сборка проекта", "Готово: " + os.path.basename(pkg["zip"]),
+            level=saver._enum(Qgis, "MessageLevel", level), duration=10)
 
     def _report(self, results, folder):
         ok = [r for r in results if r["ok"]]
@@ -355,6 +523,8 @@ class SaveTempLayersDialog(QDialog):
             self.log.appendPlainText(line)
 
         self.log.appendPlainText("\nПапка: " + folder)
+        self._last_folder = folder
+        self.btn_open.setVisible(bool(ok))
         text = "Сохранено слоёв: {} из {} в папку {}".format(len(ok), len(results), folder)
         level = "Success" if not failed else "Warning"
         self.iface.messageBar().pushMessage(
@@ -365,10 +535,10 @@ class SaveTempLayersDialog(QDialog):
                 "Не забудьте сохранить проект.")
 
     def _set_controls_enabled(self, enabled):
-        for w in (self.mode_temp, self.mode_all, self.folder, self.format, self.crs,
-                  self.gpkg_name, self.layers, self.btn_all,
-                  self.btn_none, self.btn_refresh, self.replace, self.styles,
-                  self.overwrite, self.btn_save):
+        for w in tuple(self._radios.values()) + self._pkg_widgets + (
+                self.folder, self.format, self.crs, self.gpkg_name, self.layers, self.btn_all,
+                self.btn_none, self.btn_refresh, self.replace, self.styles,
+                self.overwrite, self.btn_save):
             w.setEnabled(enabled)
         self.btn_close.setText("Закрыть" if enabled else "Отмена")
         if enabled:

@@ -391,7 +391,7 @@ def _repoint(layer, uri, provider, project, crs=None):
 
 def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 replace=True, save_styles=True, overwrite=False, crs=None,
-                progress=None, is_cancelled=None):
+                progress=None, is_cancelled=None, own_fields_only=None):
     """Сохраняет слои items = [(layer, kind, temporary), ...] в папку folder.
 
     crs — система координат для сохранения; None / недействительная — как у слоя.
@@ -399,8 +399,15 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
     редактирования попадают только в копию, а файлы, из которых читают слои
     проекта, не перезаписываются даже при overwrite=True.
 
-    Возвращает список словарей {"name", "ok", "path", "message"}.
+    own_fields_only — писать только собственные поля слоя (без объединений и
+    выражений); по умолчанию так делается при replace=True.
+
+    Возвращает список словарей {"id", "name", "ok", "path", "message", "uri",
+    "provider", "crs"}: uri/provider — как открыть сохранённое (для копии
+    проекта), crs — СК, в которую слой перепроецирован, или None.
     """
+    if own_fields_only is None:
+        own_fields_only = replace
     fmt = FORMATS_BY_KEY[fmt_key]
     driver, ext = fmt["driver"], fmt["ext"]
     os.makedirs(folder, exist_ok=True)
@@ -427,9 +434,11 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
         if progress:
             progress(i, total, name)
         base = safe_name(name)
-        res = {"name": name, "ok": False, "path": "", "message": ""}
+        res = {"id": layer.id(), "name": name, "ok": False, "path": "", "message": "",
+               "uri": "", "provider": "", "crs": None}
         notes = []
         can_repoint = replace
+        own_only = own_fields_only and (can_repoint or not replace)
         try:
             if isinstance(layer, QgsVectorLayer) and layer.isEditable():
                 if temporary:
@@ -448,12 +457,14 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
 
             target = _target_crs(layer, crs, notes)
             ct = QgsCoordinateTransform(layer.crs(), target, tc) if target else None
+            res["crs"] = target
 
             if kind == "raster":
                 path, stem = _save_raster(layer, folder, base, overwrite, taken, protected, target)
                 taken.add(stem.lower())
                 if save_styles:
                     layer.saveNamedStyle(os.path.splitext(path)[0] + ".qml")
+                res.update(uri=path, provider="gdal")
                 if can_repoint and not _repoint(layer, path, "gdal", project, target):
                     raise RuntimeError("файл сохранён, но слой не удалось переключить на него")
                 res.update(ok=True, path=path)
@@ -463,8 +474,9 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 taken.add(layer_name.lower())
                 action = CREATE_LAYER if os.path.exists(single_path) else CREATE_FILE
                 new_file, new_layer = _write_vector(layer, single_path, driver, layer_name, action, tc, ct,
-                                                    own_fields_only=can_repoint)
+                                                    own_fields_only=own_only)
                 uri = "{}|layername={}".format(new_file, new_layer)
+                res.update(uri=uri, provider="ogr")
                 if save_styles:
                     try:
                         err = _copy_style_to_gpkg(layer, uri, new_layer)
@@ -491,17 +503,25 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 taken.add(stem.lower())
                 path = os.path.join(folder, stem + "." + ext)
                 new_file, new_layer = _write_vector(layer, path, driver, stem, CREATE_FILE, tc, ct,
-                                                    own_fields_only=can_repoint)
+                                                    own_fields_only=own_only)
                 if not os.path.exists(new_file):
                     # Shapefile без геометрии записывается только как .dbf
                     dbf = os.path.splitext(new_file)[0] + ".dbf"
                     if os.path.exists(dbf):
                         new_file = dbf
                 uri = "{}|layername={}".format(new_file, new_layer) if driver == "GPKG" else new_file
+                res.update(uri=uri, provider="ogr")
                 if save_styles:
-                    msg, ok = layer.saveNamedStyle(os.path.splitext(new_file)[0] + ".qml")
-                    if not ok:
-                        notes.append("стиль не сохранён: " + msg)
+                    if driver == "GPKG":  # стиль — внутрь GeoPackage, один файл на слой
+                        try:
+                            err = _copy_style_to_gpkg(layer, uri, new_layer)
+                        except Exception as e:  # noqa: BLE001
+                            err = str(e)
+                    else:
+                        msg, ok = layer.saveNamedStyle(os.path.splitext(new_file)[0] + ".qml")
+                        err = "" if ok else msg
+                    if err:
+                        notes.append("стиль не сохранён: " + err)
                 if can_repoint and not _repoint(layer, uri, "ogr", project, target):
                     raise RuntimeError("файл сохранён, но слой не удалось переключить на него")
                 res.update(ok=True, path=new_file)

@@ -4,6 +4,7 @@
 пишутся во временный профиль tests/_profile, результаты — в tests/_out.
 """
 
+import glob
 import os
 import shutil
 import sys
@@ -25,6 +26,7 @@ QCoreApplication.setApplicationName("temp-layers-tests")
 
 from qgis.core import (  # noqa: E402
     QgsApplication,
+    QgsLayoutSize,
     QgsCoordinateReferenceSystem,
     QgsFeature,
     QgsGeometry,
@@ -172,6 +174,10 @@ def test_gpkg_per_layer():
     p, items, folder, res = save("gpkg", "gpkg")
     check_saved(p, items, res)
     assert os.path.exists(os.path.join(folder, "Участки_2.gpkg"))
+    # стиль внутри GeoPackage, без отдельного .qml
+    assert not os.path.exists(os.path.join(folder, "Точки_ скважины_2.qml"))
+    vl = QgsVectorLayer(os.path.join(folder, "Точки_ скважины_2.gpkg"), "x", "ogr")
+    assert vl.renderer().symbol().color().name() == "#ff0000"
 
 
 def test_shapefile():
@@ -322,6 +328,260 @@ def test_all_layers_replace():
     for layer in (pts, dem, mem):
         assert layer.isValid() and layer.crs() == UTM37 and "all_replace" in layer.source(), layer.source()
     assert os.path.exists(gj), "исходный файл должен остаться на месте"
+
+
+def _font_by_license(kind):
+    """Файл системного шрифта с нужным видом лицензии и его семейство."""
+    from temp_layers_to_folder import fonts
+
+    for path in sorted(glob.glob("/System/Library/Fonts/Supplemental/*.ttf")):
+        fams, lic, copyright_text, fs_type = fonts.read_font(path)
+        if fams and fonts.license_kind(lic, copyright_text, fs_type) == kind:
+            return path, sorted(fams)[0]
+    raise AssertionError("нет шрифта с лицензией " + kind)
+
+
+def _lep_project():
+    """Проект «Проект ЛЭП/Проект ЛЭП.qgz»: слой в памяти со своим SVG и подписью
+    свободным шрифтом, файл GeoJSON с платным шрифтом, лишний слой, подложка,
+    макет с картинкой, надписью шрифтом без лицензии и картой."""
+    from qgis.core import (QgsLayoutItemLabel, QgsLayoutItemMap, QgsLayoutItemPicture,
+                           QgsMarkerSymbol, QgsPalLayerSettings, QgsPrintLayout, QgsRectangle,
+                           QgsSingleSymbolRenderer, QgsSvgMarkerSymbolLayer, QgsTextFormat,
+                           QgsVectorLayerSimpleLabeling)
+    from qgis.PyQt.QtGui import QFont
+
+    from temp_layers_to_folder import fonts
+
+    font_dir = os.path.join(OUT, "fontdir")
+    os.makedirs(font_dir, exist_ok=True)
+    fams = {}
+    for kind in (fonts.FREE, fonts.PAID):
+        path, fams[kind] = _font_by_license(kind)
+        shutil.copy(path, font_dir)
+
+    def labels(layer, family):
+        pal = QgsPalLayerSettings()
+        pal.fieldName = "'x'"
+        pal.isExpression = True
+        fmt = QgsTextFormat()
+        fmt.setFont(QFont(family))
+        pal.setFormat(fmt)
+        layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+        layer.setLabelsEnabled(True)
+
+    svg = os.path.join(OUT, "assets", "знак.svg")
+    os.makedirs(os.path.dirname(svg), exist_ok=True)
+    with open(svg, "w") as fh:
+        fh.write('<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">'
+                 '<circle cx="5" cy="5" r="4" fill="red"/></svg>')
+
+    p = QgsProject.instance()
+    p.clear()
+    p.setCrs(QgsCoordinateReferenceSystem("EPSG:4326"))
+    src, gj, vrt = make_permanent_sources()
+    mem = QgsVectorLayer("Point?crs=EPSG:4326", "Черновик", "memory")
+    f = QgsFeature()
+    f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(39.2, 48.6)))
+    mem.dataProvider().addFeature(f)
+    symbol = QgsMarkerSymbol()
+    symbol.changeSymbolLayer(0, QgsSvgMarkerSymbolLayer(svg))
+    mem.setRenderer(QgsSingleSymbolRenderer(symbol))
+    labels(mem, fams[fonts.FREE])
+    pts = QgsVectorLayer(gj, "Опоры", "ogr")
+    labels(pts, fams[fonts.PAID])
+    extra = QgsVectorLayer(gj, "Лишний", "ogr")
+    xyz = QgsRasterLayer("type=xyz&url=https://tile.openstreetmap.org/{z}/{x}/{y}.png&zmax=19&zmin=0",
+                         "OpenStreetMap", "wms")
+    p.addMapLayers([mem, pts, extra, xyz])
+    layout = QgsPrintLayout(p)
+    layout.initializeDefaults()
+    layout.setName("Лист 1")
+    pic = QgsLayoutItemPicture(layout)
+    pic.setPicturePath(svg)
+    layout.addLayoutItem(pic)
+    label = QgsLayoutItemLabel(layout)
+    fmt = QgsTextFormat()
+    fmt.setFont(QFont("НетТакогоШрифта"))
+    label.setTextFormat(fmt)
+    layout.addLayoutItem(label)
+    lmap = QgsLayoutItemMap(layout)
+    lmap.attemptResize(QgsLayoutSize(100, 100))
+    lmap.setExtent(QgsRectangle(39.0, 48.4, 39.4, 48.8))
+    layout.addLayoutItem(lmap)
+    p.layoutManager().addLayout(layout)
+    folder = os.path.join(OUT, "Проект ЛЭП")
+    os.makedirs(folder, exist_ok=True)
+    return p, folder, font_dir, fams, svg, src, gj, (mem, pts, extra, xyz)
+
+
+def test_font_license_kind():
+    from temp_layers_to_folder.fonts import FREE, PAID, UNKNOWN, license_kind
+
+    assert license_kind("Licensed under the Open Font License, version 1.1", "", 0) == FREE
+    assert license_kind("", "Copyright 2015 ... with Reserved Font Name X. SIL Open Font License", 0) == FREE
+    assert license_kind("http://www.apache.org/licenses/LICENSE-2.0", "", 8) == FREE
+    assert license_kind("You may use this font as permitted by the EULA", "", 8) == PAID
+    assert license_kind("", "Copyright (c) Foundry", 4) == PAID  # «только просмотр и печать»
+    assert license_kind("", "Copyright (c) Someone", 0) == UNKNOWN
+
+
+def test_consolidate_project():
+    """Сборка: data_all рядом с проектом, проект переключён и сохранён, архив со
+    свободными шрифтами; после удаления исходников проект открывается."""
+    import datetime
+    import zipfile
+
+    from qgis.core import QgsLayoutItemMap, QgsLayoutItemPicture
+
+    from temp_layers_to_folder import fonts, packager
+
+    p, folder, font_dir, fams, svg, src, gj, (mem, pts, extra, xyz) = _lep_project()
+    try:
+        packager.consolidate_project(p, [], "gpkg")
+        raise AssertionError("ожидалась ошибка для несохранённого проекта")
+    except RuntimeError as e:
+        assert "сохраните проект" in str(e)
+
+    proj = os.path.join(folder, "Проект ЛЭП.qgz")
+    assert p.write(proj)
+    day = datetime.date(2026, 9, 18)
+    res = packager.consolidate_project(p, [(mem, "memory", True), (pts, "vector", False)], "gpkg",
+                                       crs=UTM37, font_dirs=[font_dir], today=day)
+
+    # 1. data_all рядом с проектом, проект переключён, пересчитан и сохранён
+    data = os.path.join(folder, "data_all")
+    assert res["data_dir"] == data
+    for rel in ("Черновик.gpkg", "Опоры.gpkg", "images/знак.svg"):
+        assert os.path.isfile(os.path.join(data, rel)), rel
+    for layer in (mem, pts):
+        assert layer.source().startswith(data) and layer.crs() == UTM37, layer.source()
+    assert extra.source() == gj, "неотмеченный слой не трогаем"
+    assert p.crs() == UTM37 and not p.isDirty() and p.fileName() == proj
+    lmap = [i for i in p.layoutManager().layoutByName("Лист 1").items() if isinstance(i, QgsLayoutItemMap)][0]
+    assert 400000 < lmap.extent().center().x() < 600000, lmap.extent().toString()
+    assert mem.renderer().symbol().symbolLayer(0).path() == os.path.join(data, "images", "знак.svg")
+
+    # «удаляем всё остальное» — проект продолжает работать
+    shutil.move(src, src + "_удалено")
+    shutil.move(os.path.dirname(svg), os.path.dirname(svg) + "_удалено")
+    p3 = QgsProject()
+    assert p3.read(proj)
+    for layer in (mem, pts):
+        l3 = p3.mapLayer(layer.id())
+        assert l3.isValid() and l3.featureCount() > 0 and l3.crs() == UTM37, l3.source()
+    assert os.path.isfile(p3.mapLayer(mem.id()).renderer().symbol().symbolLayer(0).path())
+    pic3 = [i for i in p3.layoutManager().layoutByName("Лист 1").items() if isinstance(i, QgsLayoutItemPicture)][0]
+    assert not pic3.isMissingImage()
+    shutil.move(src + "_удалено", src)
+    shutil.move(os.path.dirname(svg) + "_удалено", os.path.dirname(svg))
+
+    # 2. архив рядом с проектом
+    zip_path = os.path.join(folder, "Проект ЛЭП_архив_2026-09-18.zip")
+    assert res["zip"] == zip_path and os.path.isfile(zip_path)
+    names = zipfile.ZipFile(zip_path).namelist()
+    root = "Проект ЛЭП_архив_2026-09-18/"
+    for rel in ("Проект ЛЭП.qgz", "data_all/Черновик.gpkg", "data_all/Опоры.gpkg",
+                "data_all/images/знак.svg", "Состав.txt"):
+        assert root + rel in names, (rel, names)
+    font_files = [n for n in names if "/fonts/" in n]
+    assert len(font_files) == 1 and font_files[0].startswith(root + "data_all/fonts/"), font_files
+    assert len(os.listdir(os.path.join(data, "fonts"))) == 1  # только свободный, и на диске тоже
+    assert list(res["fonts"]["free"]) == [fams[fonts.FREE]]
+    assert res["fonts"]["paid"] == [fams[fonts.PAID]] and res["fonts"]["missing"] == ["НетТакогоШрифта"]
+    assert not [n for n in names if n.endswith(("-wal", "-shm"))], names
+    assert not [n for n in os.listdir(folder) if n.startswith(".")], "временная копия проекта не удалена"
+    assert res["excluded"] == ["Лишний"] and res["online"] == ["OpenStreetMap"]
+    readme = zipfile.ZipFile(zip_path).read(root + "Состав.txt").decode("utf-8-sig")
+    assert "Опоры — data_all/Опоры.gpkg" in readme and "платные" in readme and "EPSG:32637" in readme
+
+    # архив открывается в другом месте; лишнего слоя в нём нет, подложка есть
+    unpacked = os.path.join(OUT, "unzipped")
+    zipfile.ZipFile(zip_path).extractall(unpacked)
+    p4 = QgsProject()
+    assert p4.read(os.path.join(unpacked, root, "Проект ЛЭП.qgz"))
+    assert p4.mapLayer(extra.id()) is None and p4.mapLayer(xyz.id()) is not None
+    for layer in (mem, pts):
+        l4 = p4.mapLayer(layer.id())
+        assert l4.isValid() and "unzipped" in l4.source() and l4.labelsEnabled(), l4.source()
+
+    # повторная сборка: слои уже в data_all — не копируются заново; архив _2
+    res2 = packager.consolidate_project(p, [(mem, "vector", False), (pts, "vector", False)], "gpkg",
+                                        crs=UTM37, include_fonts=False, today=day)
+    assert res2["results"] == [] and sorted(res2["already"]) == ["Опоры", "Черновик"]
+    assert res2["zip"].endswith("Проект ЛЭП_архив_2026-09-18_2.zip")
+    assert not [n for n in os.listdir(data) if "_2." in n], os.listdir(data)
+
+
+def test_dialog_package():
+    """Режим сборки в окне: предлагает сохранить проект, спрашивает подтверждение,
+    собирает data_all и архив рядом с проектом."""
+    from qgis.PyQt.QtWidgets import QMainWindow, QMessageBox
+
+    from temp_layers_to_folder import dialog as dlg_mod
+
+    p = make_project()
+    folder = os.path.join(OUT, "Диалог")
+    os.makedirs(folder, exist_ok=True)
+    saved_as = os.path.join(folder, "Диалог.qgz")
+
+    class Bar:
+        messages = []
+
+        def pushMessage(self, *a, **k):
+            self.messages.append(a)
+
+    class SaveAction:
+        def trigger(self):
+            p.write(saved_as)
+
+    class Iface:
+        def __init__(self):
+            self.w, self.bar = QMainWindow(), Bar()
+
+        def mainWindow(self): return self.w
+        def messageBar(self): return self.bar
+        def layerTreeView(self): return None
+        def actionSaveProject(self): return SaveAction()
+
+    iface = Iface()
+    d = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
+    d.mode_package.setChecked(True)
+    assert d.btn_save.text() == "Собрать" and d.layers_box.title() == "Слои для передачи"
+    assert d.replace.isHidden() and d.overwrite.isHidden() and d.folder.isHidden()
+    assert "ещё не сохранён" in d.package_hint.text() and d.btn_open.isHidden()
+    assert len(list(d._items())) == 6  # все слои проекта
+    d.pkg_fonts.setChecked(False)
+
+    # «Нет» на вопросе — ничего не происходит
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.No)
+    d.run()
+    assert not p.fileName() and not os.path.exists(os.path.join(folder, "data_all"))
+
+    asked = []
+
+    def yes(*a, **k):
+        asked.append(a[2] if len(a) > 2 else "")
+        return QMessageBox.StandardButton.Yes
+
+    QMessageBox.question = staticmethod(yes)
+    if os.environ.get("SCREENSHOT_PACKAGE"):
+        p.write(saved_as)
+        d._update_package_hint()
+        d.package_hint.setText(d.package_hint.text().replace(OUT, "/Users/me/Documents"))
+        d.resize(620, 720)
+        d.show()
+        QgsApplication.processEvents()
+        d.grab().save(os.environ["SCREENSHOT_PACKAGE"])
+    d.run()
+    assert p.fileName() == saved_as and not p.isDirty()
+    assert any("data_all" in q for q in asked), asked  # подтверждение перед сборкой
+    assert os.path.isdir(os.path.join(folder, "data_all"))
+    zips = [n for n in os.listdir(folder) if n.endswith(".zip")]
+    assert len(zips) == 1 and zips[0].startswith("Диалог_архив_"), (zips, d.log.toPlainText())
+    assert "Архив:" in d.log.toPlainText() and not d.btn_open.isHidden()
+    assert iface.bar.messages[-1][0] == "Сборка проекта"
+    assert saver.find_temporary_layers(p) == [], "временные слои должны переехать в data_all"
 
 
 def test_joins_relations_expressions():

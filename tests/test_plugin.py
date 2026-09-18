@@ -43,6 +43,10 @@ app = QgsApplication([], True, PROFILE)
 if os.environ.get("QGIS_PREFIX_PATH"):
     app.setPrefixPath(os.environ["QGIS_PREFIX_PATH"], True)
 app.initQgis()
+# initQgis() переносит настройки в ~/Library/Application Support/<организация>/…/profiles/default,
+# которую никто не чистит: возвращаем их во временный профиль.
+QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, PROFILE)
+assert QSettings().fileName().startswith(PROFILE), QSettings().fileName()
 
 from osgeo import gdal, ogr, osr  # noqa: E402
 
@@ -787,5 +791,10 @@ if __name__ == "__main__":
             print("FAIL ", name)
             traceback.print_exc()
     print("\n{} из {} проверок пройдено".format(len(tests) - failed, len(tests)))
+    # Папка профиля, созданная initQgis() для тестовой организации (qgis.db, стили), — только наша.
+    leftover = os.path.dirname(os.path.dirname(os.path.dirname(
+        QgsApplication.qgisSettingsDirPath().rstrip("/"))))
     app.exitQgis()
+    if os.path.basename(leftover) == "temp-layers-tests":
+        shutil.rmtree(leftover, ignore_errors=True)
     sys.exit(1 if failed else 0)

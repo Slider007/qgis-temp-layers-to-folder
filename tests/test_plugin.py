@@ -38,6 +38,7 @@ from qgis.core import (  # noqa: E402
 )
 from qgis.PyQt.QtCore import QEvent, QMetaType  # noqa: E402
 from qgis.PyQt.QtGui import QColor  # noqa: E402
+from qgis.PyQt.QtWidgets import QMenu  # noqa: E402
 
 app = QgsApplication([], True, PROFILE)
 if os.environ.get("QGIS_PREFIX_PATH"):
@@ -47,6 +48,7 @@ app.initQgis()
 # которую никто не чистит: возвращаем их во временный профиль.
 QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, PROFILE)
 assert QSettings().fileName().startswith(PROFILE), QSettings().fileName()
+_PLUGIN_MENU = QMenu("Модули")  # меню «Модули» для поддельного iface
 
 from osgeo import gdal, ogr, osr  # noqa: E402
 
@@ -804,6 +806,7 @@ def test_toolbar_buttons():
         def mainWindow(self): return win
         def layerTreeView(self): return None
         def addPluginToMenu(self, m, a): menus.append((m, a.text()))
+        def pluginMenu(self): return _PLUGIN_MENU
         def removePluginMenu(self, m, a): menus.remove((m, a.text()))
 
         def addToolBar(self, name):
@@ -848,6 +851,7 @@ def test_plugin_window_non_modal():
         def layerTreeView(self): return None
         def addToolBar(self, name): return win.addToolBar(name)
         def addPluginToMenu(self, m, a): pass
+        def pluginMenu(self): return _PLUGIN_MENU
         def removePluginMenu(self, m, a): pass
 
     plugin = temp_layers_to_folder.classFactory(Iface())
@@ -890,6 +894,9 @@ def test_dialog():
             return self.w.addToolBar(name)
 
         def addPluginToMenu(self, m, a): pass
+
+        def pluginMenu(self): return _PLUGIN_MENU
+
         def removePluginMenu(self, m, a): pass
 
     make_project()

@@ -11,9 +11,6 @@ try:  # Qt6 / QGIS 4: QAction живёт в QtGui
 except ImportError:  # Qt5 / QGIS 3
     from qgis.PyQt.QtWidgets import QAction
 
-# Общее подменю модулей компании в «Модулях». QGIS находит подменю по названию,
-# поэтому у всех наших модулей эта строка должна совпадать буква в букву.
-MENU = "&Альтан-Эко"
 
 
 class SaveTempLayersPlugin:
@@ -33,7 +30,7 @@ class SaveTempLayersPlugin:
         self.action.setToolTip("Сохранить временные (или все) слои проекта в выбранную папку")
         self.action.triggered.connect(self.run)
         altan_toolbar.add_action(self.iface, self.action)
-        self.iface.addPluginToMenu(MENU, self.action)
+        altan_toolbar.add_to_menu(self.iface, self.action)
         self._add_to_layers_panel()
 
     def _find_layers_toolbar(self):
@@ -67,7 +64,7 @@ class SaveTempLayersPlugin:
             self.layers_toolbar = self.layers_separator = None
         if self.action:
             altan_toolbar.remove_action(self.iface, self.action)
-            self.iface.removePluginMenu(MENU, self.action)
+            altan_toolbar.remove_from_menu(self.iface, self.action)
             self.action.deleteLater()
             self.action = None
         if self.dialog:

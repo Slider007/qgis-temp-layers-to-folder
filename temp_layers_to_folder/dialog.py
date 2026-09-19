@@ -55,7 +55,7 @@ class SaveTempLayersDialog(QDialog):
         self._busy = False
         self._cancel = False
 
-        self.setWindowTitle("Сохранение слоёв в папку")
+        self.setWindowTitle("Сохранение временных слоёв")
         # без setMinimumWidth: явный минимум отменяет минимум раскладки, и строка
         # режима сборки с флажком «Создать архив» обрезается
         root = QVBoxLayout(self)

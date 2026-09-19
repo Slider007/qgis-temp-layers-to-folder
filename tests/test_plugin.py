@@ -825,6 +825,10 @@ def test_dialog():
     d = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
     d.folder.setFilePath(os.path.join(OUT, "dialog"))
     d.crs.setCrs(UTM37)
+    # название модуля и окна — одно
+    meta = open(os.path.join(os.path.dirname(HERE), "temp_layers_to_folder", "metadata.txt"), encoding="utf-8").read()
+    assert "\nname=Сохранение временных слоёв\n" in meta
+    assert d.windowTitle() == "Сохранение временных слоёв", d.windowTitle()
     # два режима: временные слои и сборка в data_all; «Создать архив» — только у сборки
     assert sorted(d._radios) == [dlg_mod.MODE_PACKAGE, dlg_mod.MODE_TEMP] and not hasattr(d, "mode_all")
     assert not hasattr(d, "structure")

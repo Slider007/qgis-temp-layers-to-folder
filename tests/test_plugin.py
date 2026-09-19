@@ -653,6 +653,862 @@ def test_dialog_package_without_archive():
     d2._save_settings()
 
 
+def _geojson(path, x=39.1):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write('{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"n":1},'
+                 '"geometry":{"type":"Point","coordinates":[%s,48.5]}}]}' % x)
+    return path
+
+
+def _svg_symbol(layer, svg):
+    from qgis.core import QgsMarkerSymbol, QgsSingleSymbolRenderer, QgsSvgMarkerSymbolLayer
+
+    os.makedirs(os.path.dirname(svg), exist_ok=True)
+    with open(svg, "w") as fh:
+        fh.write('<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">'
+                 '<circle cx="5" cy="5" r="4" fill="red"/></svg>')
+    symbol = QgsMarkerSymbol()
+    symbol.changeSymbolLayer(0, QgsSvgMarkerSymbolLayer(svg))
+    layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+
+
+def _tif(path, srs=True):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ds = gdal.GetDriverByName("GTiff").Create(path, 10, 10, 1, gdal.GDT_Int16)
+    ds.SetGeoTransform([39.0, 0.01, 0, 48.8, 0, -0.01])
+    sr = osr.SpatialReference()
+    sr.ImportFromEPSG(4326)
+    if srs:
+        ds.SetProjection(sr.ExportToWkt())
+    ds.GetRasterBand(1).Fill(120)
+    ds = None
+    return path
+
+
+def structure_project(root):
+    """Проект в root/Проект, данные в его подпапках и во внешней папке root/Архив.
+    Два слоя «Слой» с одинаковым именем — в разных подпапках. У «Опор» значок из
+    папки проекта, у «Черновика» — из папки вне проекта."""
+    p = QgsProject.instance()
+    p.clear()
+    shutil.rmtree(root, ignore_errors=True)
+    proj_dir = os.path.join(root, "Проект")
+    layers = {
+        "opory": QgsVectorLayer(_geojson(os.path.join(proj_dir, "Данные", "Вектор", "Опоры.geojson")),
+                                "Опоры", "ogr"),
+        "dem": QgsRasterLayer(_tif(os.path.join(proj_dir, "Данные", "Растры", "dem.tif")), "Рельеф", "gdal"),
+        "top": QgsVectorLayer(_geojson(os.path.join(proj_dir, "Карта.geojson")), "Карта", "ogr"),
+        "topo": QgsVectorLayer(_geojson(os.path.join(root, "Архив", "Топо", "a.geojson")), "Слой", "ogr"),
+        "soil": QgsVectorLayer(_geojson(os.path.join(root, "Архив", "Почвы", "b.geojson"), 39.2), "Слой", "ogr"),
+        "mem": QgsVectorLayer("Point?crs=EPSG:4326", "Черновик", "memory"),
+    }
+    assert all(l.isValid() for l in layers.values())
+    _svg_symbol(layers["opory"], os.path.join(proj_dir, "Данные", "Значки", "опора.svg"))
+    _svg_symbol(layers["mem"], os.path.join(root, "Значки", "знак.svg"))
+    p.addMapLayers(list(layers.values()))
+    return p, proj_dir, layers
+
+
+class _Home:
+    """Домашняя папка на время проверки: внешние пути считаются от неё."""
+
+    def __init__(self, path):
+        self.path, self.old = path, None
+
+    def __enter__(self):
+        self.old = os.environ.get("HOME")
+        os.environ["HOME"] = self.path
+
+    def __exit__(self, *exc):
+        os.environ["HOME"] = self.old
+
+
+def test_structure_paths():
+    """Правила раскладки: data/… → data_all/…, прямо в проекте → data_all/,
+    другая папка проекта → data_all/<путь>, вне проекта → external_links/<обрезанный путь>."""
+    import ntpath
+
+    from temp_layers_to_folder import copier as c
+
+    def ext(d, **kw):
+        return c.external_subdir(d, "C:\\Users\\roman", pm=ntpath, **kw)
+
+    assert ext("C:\\Users\\roman\\Desktop\\ЛЭП\\узел7") == "Desktop/ЛЭП/узел7"
+    assert ext("D:\\GIS") == "D/GIS"
+    assert ext("\\\\server\\share\\a") == "_server_share/a"
+    assert ext("C:\\Users\\roman\\Desktop\\ЛЭП\\узел7\\2024\\июль") == "узел7/2024/июль"  # последние 3
+    assert ext("D:\\a\\b\\c\\d") == "D/b/c/d"  # имя диска не считается уровнем
+    assert ext("D:\\a\\b\\c\\d", max_depth=2) == "D/c/d"
+    assert ext("C:\\Program Files\\QGIS\\svg") == "C/QGIS/svg"  # системные папки выбрасываются
+    assert ext("C:\\Users\\roman\\AppData\\Roaming\\QGIS") == "Roaming/QGIS"
+    assert ext("C:\\Users\\roman") == ""
+    home = "/Users/user"
+    yd = "/Volumes/YD/Yandex.Disk.localized/Работа/(Заказчик)/ВЛ/3. Карты/9. ГИС/data/02. КФ"
+    assert c.external_subdir(yd, home) == "YD/9. ГИС/data/02. КФ"
+    assert c.external_subdir("/Users/user/Downloads", home) == "Downloads"
+    assert c.external_subdir("/usr/share/gis", home) == "share/gis"
+
+    P = "/work/Проект"
+
+    def t(d):
+        return c.target_subdir(d, P, P + "/data_all", home=home)
+
+    assert t(P + "/data/ЛЕС/2024") == "ЛЕС/2024"  # 1
+    assert t(P + "/data") == ""
+    assert t(P) == ""  # 2
+    assert t(P + "/Рабочие файлы/gpkg") == "Рабочие файлы/gpkg"  # 3
+    assert t(P + "/data_all/ЛЕС") == "ЛЕС"  # уже собранное остаётся на месте
+    assert t("/Users/user/Desktop/ЛЭП/узел7") == "external_links/Desktop/ЛЭП/узел7"  # 4
+    assert t("/Users/user") == "external_links"
+
+
+def _write(path, text=""):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return path
+
+
+def _vector_file(path, driver, layer_name=None, n=2, append=False):
+    from qgis.core import QgsCoordinateTransformContext, QgsVectorFileWriter
+
+    mem = QgsVectorLayer("Point?crs=EPSG:4326&field=n:integer", "src", "memory")
+    for i in range(n):
+        f = QgsFeature(mem.fields())
+        f.setAttributes([i])
+        f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(39.1 + i / 10, 48.5)))
+        mem.dataProvider().addFeature(f)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    opts = QgsVectorFileWriter.SaveVectorOptions()
+    opts.driverName = driver
+    if layer_name:
+        opts.layerName = layer_name
+    if append:
+        opts.actionOnExistingFile = saver.CREATE_LAYER
+    res = QgsVectorFileWriter.writeAsVectorFormatV3(mem, path, QgsCoordinateTransformContext(), opts)
+    assert res[0] == 0, res
+    return path
+
+
+def copy_project(root):
+    """Проект со всеми видами источников из ТЗ. Возвращает (project, proj_dir, home, {ключ: слой})."""
+    import zipfile
+
+    from qgis.core import (QgsPalLayerSettings, QgsTextBackgroundSettings, QgsTextFormat,
+                           QgsVectorLayerSimpleLabeling)
+
+    p = QgsProject.instance()
+    p.clear()
+    shutil.rmtree(root, ignore_errors=True)
+    P = os.path.join(root, "Проект")
+    home = os.path.join(root, "home")
+    j = os.path.join
+    # 1. shapefile в data/ЛЕС со всеми спутниками; рядом — чужие файлы
+    shp = _vector_file(j(P, "data", "ЛЕС", "лес.shp"), "ESRI Shapefile")
+    for ext in (".qpj", ".shp.xml", ".qml", ".qmd"):
+        _write(j(P, "data", "ЛЕС", "лес" + ext), "<x/>" if "ml" in ext or ext == ".qmd" else "")
+    _write(j(P, "data", "ЛЕС", "лесной.dbf"))
+    _write(j(P, "data", "ЛЕС", "лес.txt"), "заметки")
+    # GeoPackage с двумя слоями — копируется один раз
+    gpkg = _vector_file(j(P, "data", "ЛЕС", "2024", "участки.gpkg"), "GPKG", "a")
+    _vector_file(gpkg, "GPKG", "b", n=3, append=True)
+    # 2. прямо в папке проекта; 3. в другой папке проекта — CSV с параметрами
+    top = _vector_file(j(P, "граница.geojson"), "GeoJSON")
+    csv = _write(j(P, "Рабочие файлы", "точки.csv"), "x;y;n\n39.1;48.5;1\n39.2;48.6;2\n")
+    _write(j(P, "Рабочие файлы", "точки.csvt"), '"Real","Real","Integer"')
+    # растр с .tfw, .aux.xml и внешними пирамидами; VRT на него
+    dem = _tif(j(P, "data", "Рельеф", "dem.tif"))
+    _write(dem + ".aux.xml", "<PAMDataset/>")
+    _write(j(P, "data", "Рельеф", "dem.tfw"), "0.01\n0\n0\n-0.01\n39.005\n48.795\n")
+    ds = gdal.Open(dem)
+    ds.BuildOverviews("NEAREST", [2])
+    ds = None
+    vrt = j(P, "data", "Рельеф", "мозаика.vrt")
+    gdal.BuildVRT(vrt, [dem])
+    # NetCDF с двумя переменными: NETCDF:"файл":Band1
+    two = gdal.GetDriverByName("GTiff").Create(j(root, "two.tif"), 5, 5, 2, gdal.GDT_Int16)
+    two.SetGeoTransform([39.0, 0.01, 0, 48.8, 0, -0.01])
+    two = None
+    nc = j(P, "data", "клим", "t.nc")
+    os.makedirs(os.path.dirname(nc))
+    gdal.Translate(nc, j(root, "two.tif"), format="netCDF")
+    # zip с GeoJSON внутри — /vsizip/; папка шейпов как один источник
+    zpath = j(P, "data", "архив.zip")
+    with zipfile.ZipFile(zpath, "w") as z:
+        z.write(_vector_file(j(root, "in.geojson"), "GeoJSON"), "in.geojson")
+    folder = j(P, "data", "папка_shp")
+    _vector_file(j(folder, "x.shp"), "ESRI Shapefile")
+    _vector_file(j(folder, "y.shp"), "ESRI Shapefile")
+    # 4. вне проекта: в домашней папке; два разных файла с одинаковым обрезанным путём
+    trees = _vector_file(j(home, "Desktop", "ЛЭП", "узел7", "trees.geojson"), "GeoJSON")
+    dup1 = _vector_file(j(home, "a", "x", "y", "z", "реки.geojson"), "GeoJSON")
+    dup2 = _vector_file(j(home, "b", "x", "y", "z", "реки.geojson"), "GeoJSON")
+
+    L = {
+        "les": QgsVectorLayer(shp, "Лес", "ogr"),
+        "ga": QgsVectorLayer(gpkg + "|layername=a", "Участки А", "ogr"),
+        "gb": QgsVectorLayer(gpkg + "|layername=b|subset=\"n\" > 0", "Участки Б", "ogr"),
+        "top": QgsVectorLayer(top, "Граница", "ogr"),
+        "csv": QgsVectorLayer("file://{}?type=csv&delimiter=;&xField=x&yField=y&crs=EPSG:4326".format(csv),
+                              "Точки CSV", "delimitedtext"),
+        "dem": QgsRasterLayer(dem, "Рельеф", "gdal"),
+        "vrt": QgsRasterLayer(vrt, "Мозаика", "gdal"),
+        "nc": QgsRasterLayer('NETCDF:"{}":Band1'.format(nc), "Климат", "gdal"),
+        "zip": QgsVectorLayer("/vsizip/{}/in.geojson".format(zpath), "Из архива", "ogr"),
+        "dir": QgsVectorLayer(folder + "|layername=y", "Из папки", "ogr"),
+        "trees": QgsVectorLayer(trees, "Деревья", "ogr"),
+        "dup1": QgsVectorLayer(dup1, "Реки 1", "ogr"),
+        "dup2": QgsVectorLayer(dup2, "Реки 2", "ogr"),
+        "mem": QgsVectorLayer("Point?crs=EPSG:4326", "Черновик", "memory"),
+    }
+    bad = [k for k, l in L.items() if not l.isValid()]
+    assert not bad, bad
+    _svg_symbol(L["les"], j(P, "значки", "дерево.svg"))
+    pal = QgsPalLayerSettings()
+    pal.fieldName = "n"
+    fmt = QgsTextFormat()
+    bg = QgsTextBackgroundSettings()
+    bg.setEnabled(True)
+    bg.setType(QgsTextBackgroundSettings.ShapeType.ShapeSVG)
+    bg.setSvgFile(_write(j(home, "значки", "фон.svg"),
+                         '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>'))
+    fmt.setBackground(bg)
+    pal.setFormat(fmt)
+    L["top"].setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    L["top"].setLabelsEnabled(True)
+    p.addMapLayers(list(L.values()))
+    return p, P, home, L
+
+
+def _label_svg(layer):
+    return layer.labeling().settings().format().background().svgFile()
+
+
+def test_copy_structure():
+    """Сборка со структурой папок по ТЗ: файлы копируются как есть со спутниками,
+    контейнер — один раз, в адресе слоя меняется только путь; внешние файлы — в
+    external_links, совпавшие имена получают _2 с записью в отчёте; растры — в
+    data_all/raster; значки — в data_all/symbols. Проект открывается с диска и
+    без исходных файлов."""
+    import zipfile
+
+    from temp_layers_to_folder import packager
+
+    j = os.path.join
+    root = os.path.join(OUT, "copy")
+    p, P, home, L = copy_project(root)
+    proj = j(P, "Проект.qgz")
+    assert p.write(proj)
+    items, skipped = saver.find_layers(p, temporary_only=False)
+    assert not skipped, skipped
+    with _Home(home):
+        res = packager.consolidate_project(p, items, "gpkg", include_fonts=False, keep_structure=True)
+    D = j(P, "data_all")
+    by_name = {r["name"]: r for r in res["results"]}
+    assert all(r["ok"] for r in res["results"]), [r for r in res["results"] if not r["ok"]]
+
+    def listing(*sub):
+        return sorted(os.listdir(j(D, *sub)))
+
+    # 1. data/ЛЕС → data_all/ЛЕС: shapefile со всеми спутниками и стилями, без чужих файлов
+    assert listing("ЛЕС") == sorted(["2024", "лес.shp", "лес.shx", "лес.dbf", "лес.prj", "лес.cpg",
+                                     "лес.qpj", "лес.shp.xml", "лес.qml", "лес.qmd"]), listing("ЛЕС")
+    # GeoPackage с двумя слоями — одна копия, оба слоя на ней, фильтр слоя сохранён
+    assert [n for n in listing("ЛЕС", "2024") if not n.endswith(("-wal", "-shm"))] == ["участки.gpkg"]
+    gcopy = j(D, "ЛЕС", "2024", "участки.gpkg")
+    assert L["ga"].source() == gcopy + "|layername=a", L["ga"].source()
+    assert L["gb"].source() == gcopy + '|layername=b|subset="n" > 0', L["gb"].source()
+    assert L["gb"].featureCount() == 2
+    # 2. прямо в проекте → data_all/; 3. другая папка проекта → data_all/<путь>, параметры CSV те же
+    assert L["top"].source() == j(D, "граница.geojson")
+    assert listing("Рабочие файлы") == ["точки.csv", "точки.csvt"]
+    assert "delimiter=;&xField=x&yField=y&crs=EPSG:4326" in L["csv"].source(), L["csv"].source()
+    assert L["csv"].isValid() and L["csv"].featureCount() == 2
+    # растр со спутниками — в raster/; VRT — в GeoTIFF на своё место там же
+    assert listing("raster", "Рельеф") == ["dem.tfw", "dem.tif", "dem.tif.aux.xml", "dem.tif.ovr",
+                                           "мозаика.qml", "мозаика.tif"], listing("raster", "Рельеф")
+    assert L["nc"].source() == 'NETCDF:"{}":Band1'.format(j(D, "raster", "клим", "t.nc")) and L["nc"].isValid()
+    assert L["zip"].source().startswith("/vsizip/" + j(D, "архив.zip")) and L["zip"].isValid()
+    assert listing("папка_shp") == sorted(os.listdir(j(P, "data", "папка_shp")))  # папка целиком
+    assert L["dir"].source() == j(D, "папка_shp") + "|layername=y"
+    # 4. вне проекта — external_links с обрезкой; совпавшее имя — _2 и запись в отчёте
+    assert L["trees"].source() == j(D, "external_links", "Desktop", "ЛЭП", "узел7", "trees.geojson")
+    assert listing("external_links", "x", "y", "z") == ["реки.geojson", "реки_2.geojson"]
+    assert "скопирован как «реки_2.geojson»" in by_name["Реки 2"]["message"], by_name["Реки 2"]
+    assert not by_name["Реки 1"]["message"]
+    # слой в памяти — в корень data_all в выбранном формате
+    assert L["mem"].source().startswith(j(D, "Черновик.gpkg"))
+    # значки символов и фона подписей — в data_all/symbols
+    assert listing("symbols") == ["дерево.svg", "фон.svg"]
+    assert L["les"].renderer().symbol().symbolLayer(0).path() == j(D, "symbols", "дерево.svg")
+    assert _label_svg(L["top"]) == j(D, "symbols", "фон.svg")
+    # исходные файлы на месте
+    assert os.path.isfile(j(P, "data", "ЛЕС", "лес.shp")) and os.path.isfile(j(home, "Desktop", "ЛЭП",
+                                                                                 "узел7", "trees.geojson"))
+
+    # проект открывается с диска и без исходных данных
+    shutil.move(j(P, "data"), j(root, "data_убрана"))
+    shutil.move(home, home + "_убрана")
+    p2 = QgsProject()
+    assert p2.read(proj)
+    for key, layer in L.items():
+        l2 = p2.mapLayer(layer.id())
+        assert l2.isValid(), (key, l2.source())
+        if isinstance(l2, QgsVectorLayer):
+            assert l2.featureCount() > 0 or key == "mem", (key, l2.source())
+    assert os.path.isfile(_label_svg(p2.mapLayer(L["top"].id())))
+    shutil.move(j(root, "data_убрана"), j(P, "data"))
+    shutil.move(home + "_убрана", home)
+
+    # Состав.txt и архив — с той же раскладкой
+    z = zipfile.ZipFile(res["zip"])
+    top = os.path.splitext(os.path.basename(res["zip"]))[0] + "/"
+    for rel in ("ЛЕС/лес.shp", "ЛЕС/лес.qpj", "external_links/Desktop/ЛЭП/узел7/trees.geojson",
+                "symbols/фон.svg", "папка_шп".replace("шп", "shp") + "/y.shp"):
+        assert top + "data_all/" + rel in z.namelist(), rel
+    readme = z.read(top + "Состав.txt").decode("utf-8-sig")
+    assert "Лес — data_all/ЛЕС/лес.shp" in readme and "в data_all/symbols/" in readme, readme
+    assert "Климат — data_all/raster/клим/t.nc" in readme and "Из папки — data_all/папка_shp" in readme, readme
+    assert res["excluded"] == [], res["excluded"]  # все слои — в копии проекта для архива
+
+    # повторная сборка: всё уже в data_all — ничего не копируется
+    items, _ = saver.find_layers(p, temporary_only=False)
+    res2 = packager.consolidate_project(p, items, "gpkg", include_fonts=False, make_archive=False,
+                                        keep_structure=True)
+    assert res2["results"] == [] and len(res2["already"]) == len(items), res2["results"]
+
+
+def test_copy_structure_crs():
+    """Со структурой папок и сменой СК слой перепроецируется в выбранный формат
+    на своё место в структуре: как есть его не скопировать."""
+    from temp_layers_to_folder import packager
+
+    root = os.path.join(OUT, "copy_crs")
+    p, P, home, L = copy_project(root)
+    assert p.write(os.path.join(P, "Проект.qgz"))
+    with _Home(home):
+        res = packager.consolidate_project(p, [(L["les"], "vector", False), (L["top"], "vector", False)],
+                                           "gpkg", crs=UTM37, include_fonts=False, make_archive=False,
+                                           keep_structure=True)
+    assert all(r["ok"] for r in res["results"]), res["results"]
+    D = os.path.join(P, "data_all")
+    assert L["les"].source().startswith(os.path.join(D, "ЛЕС", "лес.gpkg")) and L["les"].crs() == UTM37
+    assert L["top"].source().startswith(os.path.join(D, "граница.gpkg"))
+
+
+def test_copy_structure_crs_container_names():
+    """Слои из одного GeoPackage при смене СК сохраняют свои имена — имя
+    файла-контейнера («участки», «участки_2») их не заменяет."""
+    from temp_layers_to_folder import packager
+
+    root = os.path.join(OUT, "copy_crs_names")
+    p, P, home, L = copy_project(root)
+    kml = _write(os.path.join(P, "data", "kml", "точки.kml"), "".join(
+        ['<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document>']
+        + ['<Folder><name>{}</name><Placemark><name>p</name><Point><coordinates>39.1,48.5</coordinates>'
+           '</Point></Placemark></Folder>'.format(n) for n in ("A", "B")] + ["</Document></kml>"]))
+    ka, kb = (QgsVectorLayer(kml + "|layername=" + n, "Слой " + n, "ogr") for n in ("A", "B"))
+    assert ka.isValid() and kb.isValid()
+    L["nc"].setCrs(QgsCoordinateReferenceSystem("EPSG:4326"))  # в файле СК нет
+    p.addMapLayers([ka, kb])
+    assert p.write(os.path.join(P, "Проект.qgz"))
+    with _Home(home):
+        res = packager.consolidate_project(
+            p, [(L["ga"], "vector", False), (L["gb"], "vector", False), (ka, "vector", False),
+                (kb, "vector", False), (L["les"], "vector", False), (L["dir"], "vector", False),
+                (L["nc"], "raster", False)],
+            "gpkg", crs=UTM37, include_fonts=False, make_archive=False, keep_structure=True)
+    assert all(r["ok"] for r in res["results"]), res["results"]
+    D = os.path.join(P, "data_all")
+
+    def names(*sub):
+        return sorted(n for n in os.listdir(os.path.join(D, *sub)) if not n.endswith(("-wal", "-shm")))
+
+    assert names("ЛЕС", "2024") == ["Участки А.gpkg", "Участки Б.gpkg"], names("ЛЕС", "2024")
+    assert names("kml") == ["Слой A.gpkg", "Слой B.gpkg"], names("kml")
+    assert "лес.gpkg" in names("ЛЕС")  # слой один в файле — имя файла
+    # слой из папки шейпов — в её подпапку; переменная NetCDF — в raster/ на место файла
+    assert names("папка_shp") == ["Из папки.gpkg"], names("папка_shp")
+    assert [n for n in names("raster", "клим") if n.endswith(".tif")] == ["Климат.tif"], names("raster", "клим")
+
+
+def _las(path, n=10):
+    """Облако точек LAS 1.2 (формат точек 0, без СК) из n×n точек."""
+    import struct
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    pts = [(500000 + i, 5380000 + k, float(i + k)) for i in range(n) for k in range(n)]
+    xs, ys, zs = zip(*pts)
+    hdr = bytearray(227)
+    hdr[0:4] = b"LASF"
+    struct.pack_into("<BB", hdr, 24, 1, 2)
+    struct.pack_into("<HII", hdr, 94, 227, 227, 0)
+    struct.pack_into("<BHII", hdr, 104, 0, 20, len(pts), len(pts))
+    struct.pack_into("<12d", hdr, 131, 0.01, 0.01, 0.01, 0, 0, 0,
+                     max(xs), min(xs), max(ys), min(ys), max(zs), min(zs))
+    with open(path, "wb") as fh:
+        fh.write(hdr)
+        for x, y, z in pts:
+            fh.write(struct.pack("<iiiHBBbBH", round(x * 100), round(y * 100), round(z * 100),
+                                 0, 0, 1, 0, 0, 0))
+    return path
+
+
+def _mesh(path):
+    return _write(path, "MESH2D\nND 1 39.0 48.5 0\nND 2 39.1 48.5 0\nND 3 39.1 48.6 0\n"
+                        "ND 4 39.0 48.6 0\nE4Q 1 1 2 3 4 1\n")
+
+
+def _raster_gpkg(path, table, append=False):
+    src = _tif(os.path.join(OUT, "_src.tif"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    gdal.Translate(path, src, format="GPKG",
+                   creationOptions=["RASTER_TABLE=" + table] + (["APPEND_SUBDATASET=YES"] if append else []))
+    return path
+
+
+def split_project(root):
+    """Проект с растрами по всем правилам раскладки, GeoPackage трёх видов
+    (растр + вектор, из которого берётся только растр; растр + вектор, оба
+    слоя в проекте; только растры), облаком точек, сетками и временным растром.
+    Возвращает (project, proj_dir, home, {ключ: слой})."""
+    from qgis.core import QgsMeshLayer, QgsPointCloudLayer
+
+    p = QgsProject.instance()
+    p.clear()
+    shutil.rmtree(root, ignore_errors=True)
+    j = os.path.join
+    P, home = j(root, "Проект"), j(root, "home")
+    road = _vector_file(j(P, "data", "Вектор", "дороги.geojson"), "GeoJSON")
+    dem = _tif(j(P, "data", "Рельеф", "dem.tif"))
+    ds = gdal.Open(dem)
+    ds.BuildOverviews("NEAREST", [2])
+    ds = None
+    for name in ("dem.tif.aux.xml", "dem.tfw", "dem.rrd", "dem.tif.vat.dbf", "dem.prj", "dem.qml",
+                 "dem.txt", "dem2.tfw"):
+        _write(j(P, "data", "Рельеф", name), "<x/>" if name.endswith(("xml", "qml")) else "")
+    mix = _raster_gpkg(j(P, "data", "База", "смесь.gpkg"), "dem")
+    _vector_file(mix, "GPKG", "pts", append=True)
+    both = _raster_gpkg(j(P, "data", "Оба", "оба.gpkg"), "dem")
+    _vector_file(both, "GPKG", "pts", append=True)
+    tiles = _raster_gpkg(j(P, "data", "Тайлы", "тайлы.gpkg"), "t1")
+    _raster_gpkg(tiles, "t2", append=True)
+    cloud = _las(j(P, "data", "Облака", "cloud.las"))
+    mesh = _mesh(j(P, "data", "Сетка", "m.2dm"))
+    mesh2 = _mesh(j(P, "data", "Сетка", "m2.2dm"))
+    depth = _write(j(P, "data", "Сетка", "m2_depth.dat"),
+                   'DATASET\nOBJTYPE "mesh2d"\nRT_JULIAN 2431887.0\nBEGSCL\nND 4\nNC 1\nNAME "Depth"\n'
+                   "TIMEUNITS hours\nTS 0 0\n1\n2\n3\n4\nENDDS\n")
+    tmp = _tif(j(QgsProcessingUtils.tempFolder(), "tests_split", "OUTPUT.tif"))
+    L = {
+        "road": QgsVectorLayer(road, "Дороги", "ogr"),
+        "dem": QgsRasterLayer(dem, "Рельеф", "gdal"),
+        "top": QgsRasterLayer(_tif(j(P, "орто.tif"), srs=False), "Орто", "gdal"),
+        "other": QgsRasterLayer(_tif(j(P, "Снимки", "2024", "s.tif")), "Снимок", "gdal"),
+        "far": QgsRasterLayer(_tif(j(home, "Desktop", "ЛЭП", "узел7", "far.tif")), "Внешний", "gdal"),
+        "mix": QgsRasterLayer(mix, "Смесь растр", "gdal"),
+        "both_r": QgsRasterLayer("GPKG:{}:dem".format(both), "Оба растр", "gdal"),
+        "both_v": QgsVectorLayer(both + "|layername=pts", "Оба вектор", "ogr"),
+        "t1": QgsRasterLayer("GPKG:{}:t1".format(tiles), "Тайл 1", "gdal"),
+        "t2": QgsRasterLayer("GPKG:{}:t2".format(tiles), "Тайл 2", "gdal"),
+        "cloud": QgsPointCloudLayer(cloud, "Облако", "pdal"),
+        "mesh": QgsMeshLayer(mesh, "Сетка", "mdal"),
+        "mesh2": QgsMeshLayer(mesh2, "Сетка с расчётом", "mdal"),
+        "tmp": QgsRasterLayer(tmp, "Уклон", "gdal"),
+    }
+    bad = [k for k, l in L.items() if not l.isValid()]
+    assert not bad, bad
+    assert L["mesh2"].addDatasets(depth)
+    L["cloud"].setCrs(UTM37)  # в файлах облака и орто СК нет — назначена в проекте
+    L["top"].setCrs(UTM37)
+    p.addMapLayers(list(L.values()))
+    # QGIS строит индекс облака «cloud.copc.laz» рядом с файлом в фоне — ждём его
+    index = j(P, "data", "Облака", "cloud.copc.laz")
+    for _ in range(100):
+        if os.path.isfile(index) and not QgsApplication.taskManager().countActiveTasks():
+            break
+        QgsApplication.processEvents()
+        import time
+        time.sleep(0.1)
+    assert os.path.isfile(index)
+    assert p.write(j(P, "Проект.qgz"))
+    return p, P, home, L
+
+
+def test_split_by_type():
+    """Растры, облака точек и сетки — в data_all/raster, pointcloud, mesh по тем
+    же правилам 1–4, со своими сопутствующими файлами. GeoPackage, где есть и
+    растр, и вектор, — в общем дереве, одной копией. Облака точек и сетки есть в
+    списке сборки только со структурой папок; сетку с подключёнными наборами
+    данных собрать нельзя — она в списке с причиной."""
+    from temp_layers_to_folder import packager
+
+    j = os.path.join
+    root = os.path.join(OUT, "split")
+    p, P, home, L = split_project(root)
+
+    items, skipped = packager.find_layers(p, keep_structure=False)
+    reasons = {l.name(): r for l, r in skipped}
+    assert reasons["Облако"] == "облако точек — только со структурой папок", reasons
+    assert "Сетка" in reasons and "Сетка с расчётом" in reasons, reasons
+    items, skipped = packager.find_layers(p, keep_structure=True)
+    kinds = {l.name(): k for l, k, _t in items}
+    assert kinds["Облако"] == "pointcloud" and kinds["Сетка"] == "mesh", kinds
+    assert saver.describe(L["cloud"], "pointcloud", False) == "облако точек .las"
+    assert saver.describe(L["mesh"], "mesh", False) == "сетка .2dm"
+    reasons = {l.name(): r for l, r in skipped}
+    assert list(reasons) == ["Сетка с расчётом"], reasons
+    assert "дополнительные наборы данных" in reasons["Сетка с расчётом"]
+
+    with _Home(home):
+        res = packager.consolidate_project(p, items + [(L["mesh2"], "mesh", False)], "gpkg",
+                                           include_fonts=False, keep_structure=True)
+    by_name = {r["name"]: r for r in res["results"]}
+    assert not by_name["Сетка с расчётом"]["ok"] and "наборы данных" in by_name["Сетка с расчётом"]["message"]
+    assert L["mesh2"].source() == j(P, "data", "Сетка", "m2.2dm")  # не тронута
+    del by_name["Сетка с расчётом"]
+    assert all(r["ok"] for r in by_name.values()), [r for r in by_name.values() if not r["ok"]]
+    D = j(P, "data_all")
+
+    def listing(*sub):
+        return sorted(n for n in os.listdir(j(D, *sub)) if not n.endswith(("-wal", "-shm")))
+
+    assert set(os.listdir(D)) == {"raster", "pointcloud", "mesh", "База", "Вектор", "Оба"}, os.listdir(D)
+    assert L["road"].source() == j(D, "Вектор", "дороги.geojson")  # вектор — в общем дереве
+    # 1–4 для растров — внутри raster/, со спутниками, без чужих файлов
+    assert listing("raster", "Рельеф") == ["dem.prj", "dem.qml", "dem.rrd", "dem.tfw", "dem.tif",
+                                           "dem.tif.aux.xml", "dem.tif.ovr", "dem.tif.vat.dbf"], \
+        listing("raster", "Рельеф")
+    assert L["dem"].source() == j(D, "raster", "Рельеф", "dem.tif")
+    assert L["top"].source() == j(D, "raster", "орто.tif")
+    assert L["other"].source() == j(D, "raster", "Снимки", "2024", "s.tif")
+    assert L["far"].source() == j(D, "raster", "external_links", "Desktop", "ЛЭП", "узел7", "far.tif")
+    # в GeoPackage есть вектор — файл в общем дереве, хотя проект берёт из него только растр
+    assert L["mix"].source() == j(D, "База", "смесь.gpkg"), L["mix"].source()
+    # растр и вектор из одного GeoPackage — одна копия в общем дереве
+    assert listing("Оба") == ["оба.gpkg"]
+    assert L["both_r"].source() == "GPKG:{}:dem".format(j(D, "Оба", "оба.gpkg")), L["both_r"].source()
+    assert L["both_v"].source() == j(D, "Оба", "оба.gpkg") + "|layername=pts"
+    # GeoPackage только с растрами — в raster/, одной копией
+    assert listing("raster", "Тайлы") == ["тайлы.gpkg"]
+    assert L["t2"].source() == "GPKG:{}:t2".format(j(D, "raster", "Тайлы", "тайлы.gpkg"))
+    # облако точек — с индексом QGIS; сетка
+    assert listing("pointcloud", "Облака") == ["cloud.copc.laz", "cloud.las"], listing("pointcloud", "Облака")
+    assert L["cloud"].source() == j(D, "pointcloud", "Облака", "cloud.las")
+    assert L["mesh"].source() == j(D, "mesh", "Сетка", "m.2dm")
+    # временный растр — в корень raster/
+    assert L["tmp"].source() == j(D, "raster", "Уклон.tif"), L["tmp"].source()
+    # СК, назначенная в проекте, у копии та же
+    assert L["cloud"].crs() == UTM37 and L["top"].crs() == UTM37, (L["cloud"].crs(), L["top"].crs())
+
+    # проект открывается с диска без исходных файлов
+    shutil.move(j(P, "data"), j(root, "data_убрана"))
+    shutil.move(home, home + "_убрана")
+    p2 = QgsProject()
+    assert p2.read(j(P, "Проект.qgz"))
+    for key, layer in L.items():
+        if key != "mesh2":
+            assert p2.mapLayer(layer.id()).isValid(), (key, p2.mapLayer(layer.id()).source())
+    assert p2.mapLayer(L["cloud"].id()).crs() == UTM37 and p2.mapLayer(L["top"].id()).crs() == UTM37
+    p2.clear()
+    shutil.move(j(root, "data_убрана"), j(P, "data"))
+    shutil.move(home + "_убрана", home)
+    readme = zipfile_readme(res["zip"])
+    assert "Облако — data_all/pointcloud/Облака/cloud.las" in readme, readme
+    assert "Сетка — data_all/mesh/Сетка/m.2dm" in readme, readme
+
+
+def zipfile_readme(path):
+    import zipfile
+
+    z = zipfile.ZipFile(path)
+    return z.read(next(n for n in z.namelist() if n.endswith("/Состав.txt"))).decode("utf-8-sig")
+
+
+def test_pointcloud_sources():
+    """Адреса облаков точек: EPT копируется папкой (ept.json внутри), у COPC
+    меняется путь при новом имени, виртуальное облако (.vpc) не копируется.
+    Папка типа: у одного типа — его папка, у разных типов в одном файле — общее
+    дерево."""
+    from qgis.core import QgsPointCloudLayer
+
+    from temp_layers_to_folder import copier
+
+    j = os.path.join
+    d = j(OUT, "pc_sources")
+    ept = _write(j(d, "ept_облако", "ept.json"), "{}")
+    _write(j(d, "ept_облако", "ept-data", "0-0-0-0.laz"))
+    src = copier.layer_source(QgsPointCloudLayer(ept, "EPT", "ept"))
+    assert src.path == j(d, "ept_облако"), src.path
+    assert src.uri(j(d, "copy", "ept_облако_2")) == j(d, "copy", "ept_облако_2", "ept.json")
+    copc = _write(j(d, "a.copc.laz"))
+    src = copier.layer_source(QgsPointCloudLayer(copc, "COPC", "copc"))
+    assert src.path == copc and src.uri(j(d, "copy", "a_2.copc.laz")) == j(d, "copy", "a_2.copc.laz")
+    vpc = QgsPointCloudLayer(_write(j(d, "все.vpc"), "{}"), "VPC", "vpc")
+    assert copier.layer_source(vpc) is None and "виртуальное облако" in copier.copy_obstacle(vpc)
+    assert copier.companion_names(j(d, "a.copc.laz"), pointcloud=True) == ["a.copc.laz"]
+
+    assert copier.unit_type({"raster"}, j(d, "x.tif")) == "raster"
+    assert copier.unit_type({"mesh"}, j(d, "x.nc")) == "mesh"
+    assert copier.unit_type({"raster", "mesh"}, j(d, "x.nc")) == ""  # NetCDF и растром, и сеткой
+    assert copier.unit_type({"vector"}, j(d, "x.shp")) == ""
+
+    class QgsPointCloudLayer:  # облако из интернета: без сети настоящий слой не открыть
+        def isValid(self): return True
+        def providerType(self): return "copc"
+        def source(self): return "https://example.com/лидар.copc.laz"
+
+    kind, _t, reason = saver.classify(QgsPointCloudLayer(), copy_as_is=True)
+    assert kind is None and reason.startswith("онлайн"), reason  # в архиве останется ссылкой
+
+
+def test_split_by_type_crs_and_off():
+    """Смена СК: растр перепроецируется в GeoTIFF на своё место в raster/, облако
+    точек копируется как есть с пометкой. Без разделения (SPLIT_BY_TYPE=False)
+    всё ложится в общее дерево."""
+    from temp_layers_to_folder import packager
+
+    j = os.path.join
+    root = os.path.join(OUT, "split_crs")
+    p, P, home, L = split_project(root)
+    items = [(L["dem"], "raster", False), (L["cloud"], "pointcloud", False)]
+    with _Home(home):
+        res = packager.consolidate_project(p, items + [(L["t1"], "raster", False), (L["t2"], "raster", False)],
+                                           "gpkg", crs=MSK, include_fonts=False, make_archive=False,
+                                           keep_structure=True)
+    assert all(r["ok"] for r in res["results"]), res["results"]
+    D = j(P, "data_all")
+    # растры из одного GeoPackage — под своими именами
+    assert sorted(n for n in os.listdir(j(D, "raster", "Тайлы")) if n.endswith(".tif")) == \
+        ["Тайл 1.tif", "Тайл 2.tif"], os.listdir(j(D, "raster", "Тайлы"))
+    assert L["dem"].source() == j(D, "raster", "Рельеф", "dem.tif") and L["dem"].crs() == MSK
+    assert not os.path.exists(j(D, "raster", "Рельеф", "dem.tfw"))  # переписан GDAL, не скопирован
+    assert L["cloud"].source() == j(D, "pointcloud", "Облака", "cloud.las")
+    assert "система координат не изменена" in res["results"][1]["message"], res["results"]
+    # повторно: облако уже в data_all — не копируется второй раз, хотя его СК другая
+    res = packager.consolidate_project(p, items, "gpkg", crs=MSK, include_fonts=False,
+                                       make_archive=False, keep_structure=True)
+    assert res["results"] == [] and len(res["already"]) == 2, res
+    assert sorted(os.listdir(j(D, "pointcloud", "Облака"))) == ["cloud.copc.laz", "cloud.las"]
+    # без структуры папок сетка не собирается
+    res = packager.consolidate_project(p, [(L["mesh"], "mesh", False)], "gpkg", include_fonts=False,
+                                       make_archive=False)
+    assert not res["results"][0]["ok"] and "только со структурой" in res["results"][0]["message"], res
+
+    root = os.path.join(OUT, "split_off")
+    p, P, home, L = split_project(root)
+    items, _ = packager.find_layers(p, keep_structure=True)
+    with _Home(home):
+        res = packager.consolidate_project(p, items, "gpkg", include_fonts=False, make_archive=False,
+                                           keep_structure=True, split_by_type=False)
+    assert all(r["ok"] for r in res["results"]), res["results"]
+    D = j(P, "data_all")
+    assert not any(os.path.exists(j(D, d)) for d in ("raster", "pointcloud", "mesh")), os.listdir(D)
+    assert L["dem"].source() == j(D, "Рельеф", "dem.tif")
+    assert L["far"].source() == j(D, "external_links", "Desktop", "ЛЭП", "узел7", "far.tif")
+    assert L["t1"].source() == "GPKG:{}:t1".format(j(D, "Тайлы", "тайлы.gpkg"))
+    assert L["cloud"].source() == j(D, "Облака", "cloud.las")
+    assert L["mesh"].source() == j(D, "Сетка", "m.2dm")
+    assert L["tmp"].source() == j(D, "Уклон.tif"), L["tmp"].source()
+
+
+def test_split_dialog_list():
+    """Облака точек и сетки становятся доступны в списке, когда включают
+    «Сохранять структуру папок»; снятые галочки у других слоёв не сбрасываются."""
+    from qgis.PyQt.QtCore import Qt
+    from qgis.PyQt.QtWidgets import QMainWindow
+
+    from temp_layers_to_folder import dialog as dlg_mod
+
+    class Iface:
+        def __init__(self):
+            self.w = QMainWindow()
+
+        def mainWindow(self): return self.w
+
+    p, P, home, L = split_project(os.path.join(OUT, "split_dlg"))
+    iface = Iface()
+    d = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
+    d.mode_package.setChecked(True)
+    d.pkg_structure.setChecked(False)
+
+    def row(name):
+        return next(d.layers.item(i) for i in range(d.layers.count())
+                    if d.layers.item(i).text().startswith(name + "   "))
+
+    assert not row("Облако").flags() & Qt.ItemFlag.ItemIsUserCheckable
+    assert "только со структурой папок" in row("Облако").text()
+    row("Дороги").setCheckState(dlg_mod.UNCHECKED)
+    d.pkg_structure.setChecked(True)
+    assert row("Облако").checkState() == dlg_mod.CHECKED and "облако точек .las" in row("Облако").text()
+    assert row("Сетка").checkState() == dlg_mod.CHECKED
+    assert not row("Сетка с расчётом").flags() & Qt.ItemFlag.ItemIsUserCheckable
+    assert row("Дороги").checkState() == dlg_mod.UNCHECKED
+    assert {l.name() for l, *_ in d._selected()} >= {"Облако", "Сетка"}
+    assert "data_all/pointcloud" in d.pkg_structure.toolTip()
+    d.pkg_structure.setChecked(False)
+    d.mode_temp.setChecked(True)
+    d._save_settings()
+    d.close()
+
+
+def test_keep_structure_dialog():
+    """Флажок «Сохранять структуру папок» — только у сборки. Проект, уже собранный
+    без подпапок, раскладке не поддаётся — окно предупреждает об этом до сборки.
+    Исходная версия проекта раскладывается; выбор запоминается."""
+    from qgis.PyQt.QtWidgets import QMainWindow, QMessageBox
+
+    from temp_layers_to_folder import dialog as dlg_mod
+
+    class Bar:
+        def pushMessage(self, *a, **k): pass
+
+    class SaveAction:
+        def trigger(self):
+            QgsProject.instance().write()
+
+    class Iface:
+        def __init__(self):
+            self.w, self.bar = QMainWindow(), Bar()
+
+        def mainWindow(self): return self.w
+        def messageBar(self): return self.bar
+        def actionSaveProject(self): return SaveAction()
+
+    asked = []
+
+    def yes(*a, **k):
+        asked.append(a[2] if len(a) > 2 else "")
+        return QMessageBox.StandardButton.Yes
+
+    QMessageBox.question = staticmethod(yes)
+    j = os.path.join
+    root = os.path.join(OUT, "struct_dlg")
+    p, proj_dir, L = structure_project(root)
+    proj = j(proj_dir, "Окно.qgz")
+    assert p.write(proj)
+    data = j(proj_dir, "data_all")
+    iface = Iface()
+    d = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
+    d.mode_temp.setChecked(True)
+    assert not d.pkg_structure.isEnabled()
+    d.mode_package.setChecked(True)
+    assert d.pkg_structure.isEnabled() and not d.pkg_structure.isChecked()
+    d.pkg_archive.setChecked(False)
+    d.pkg_fonts.setChecked(False)
+    d.crs.setCrs(QgsCoordinateReferenceSystem())
+
+    # сборка без подпапок, как в прошлых версиях, затем повторная — с флажком
+    d.run()
+    assert os.path.isfile(j(data, "Опоры.gpkg")) and "подпапк" not in asked[-1], d.log.toPlainText()
+    d.pkg_structure.setChecked(True)
+    assert "по тем же подпапкам" in d.package_hint.text(), d.package_hint.text()
+    d.run()
+    assert "без подпапок: 6" in asked[-1], asked[-1]
+    assert not os.path.exists(j(data, "Данные")), os.listdir(data)
+    d.close()
+
+    # исходная версия проекта раскладывается; флажок запомнен
+    p, proj_dir, L = structure_project(root)
+    assert p.write(proj)
+    d2 = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
+    assert d2.mode_package.isChecked() and d2.pkg_structure.isChecked()
+    with _Home(root):
+        d2.run()
+    assert "по тем же подпапкам" in asked[-1] and "без подпапок" not in asked[-1], asked[-1]
+    log = d2.log.toPlainText().replace(os.sep, "/")
+    for rel in ("Данные/Вектор/Опоры.geojson", "raster/Данные/Растры/dem.tif", "Карта.geojson",
+                "external_links/Архив/Топо/a.geojson", "external_links/Архив/Почвы/b.geojson",
+                "Черновик.gpkg"):
+        assert os.path.isfile(j(data, rel)) and "data_all/" + rel in log, (rel, log)
+    assert "Свои картинки: 2 шт. в data_all/symbols/" in log, log
+    d2.pkg_structure.setChecked(False)
+    d2.pkg_archive.setChecked(True)
+    d2.mode_temp.setChecked(True)
+    d2._save_settings()
+    d2.close()
+
+
+def test_gpkg_layer_name_with_dash():
+    """«- поворотные точки»: GDAL не создаёт таблицу GeoPackage, имя которой
+    начинается с «-». Файл называется как слой, таблица — без знака в начале.
+    Неудачная запись не оставляет пустой файл."""
+    p = QgsProject.instance()
+    p.clear()
+    lay = QgsVectorLayer("Point?crs=EPSG:4326&field=n:integer", "- поворотные точки", "memory")
+    f = QgsFeature(lay.fields())
+    f.setAttributes([1])
+    f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(39.1, 48.5)))
+    lay.dataProvider().addFeature(f)
+    p.addMapLayer(lay)
+    items = saver.find_temporary_layers(p)
+
+    out = os.path.join(OUT, "dash")
+    res = saver.save_layers(p, items, out, "gpkg", replace=False)
+    assert res[0]["ok"], res
+    path = os.path.join(out, "- поворотные точки.gpkg")
+    assert os.path.isfile(path) and "поворотные точки" in saver._existing_gpkg_layers(path)
+    res = saver.save_layers(p, items, os.path.join(OUT, "dash_single"), "gpkg_single", gpkg_name="все",
+                            replace=False)
+    assert res[0]["ok"], res
+
+    out = os.path.join(OUT, "dash_fail")
+    real = saver.gpkg_layer_name
+    saver.gpkg_layer_name = lambda name: name  # как до исправления
+    try:
+        res = saver.save_layers(p, items, out, "gpkg", replace=False)
+    finally:
+        saver.gpkg_layer_name = real
+    assert not res[0]["ok"] and "special characters" in res[0]["message"], res
+    assert os.listdir(out) == [], os.listdir(out)
+
+
+def test_deleted_source_file():
+    """Файл слоя удалили при открытом проекте: QGIS ещё рисует слой через открытый
+    файл, но сохранять и собирать его нельзя — растры и значки при этом теряются.
+    В списке такой слой виден с причиной и в сборку не идёт."""
+    from qgis.core import QgsCoordinateTransformContext, QgsVectorFileWriter
+
+    from temp_layers_to_folder import packager
+
+    root = os.path.join(OUT, "deleted")
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    mem = QgsVectorLayer("Point?crs=EPSG:4326&field=n:integer", "src", "memory")
+    f = QgsFeature(mem.fields())
+    f.setAttributes([1])
+    f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(39.1, 48.5)))
+    mem.dataProvider().addFeature(f)
+    gpkg = os.path.join(root, "src.gpkg")
+    opts = QgsVectorFileWriter.SaveVectorOptions()
+    opts.driverName = "GPKG"
+    assert QgsVectorFileWriter.writeAsVectorFormatV3(mem, gpkg, QgsCoordinateTransformContext(), opts)[0] == 0
+    tif = _tif(os.path.join(root, "src.tif"))
+
+    p = QgsProject.instance()
+    p.clear()
+    vec = QgsVectorLayer(gpkg, "Удалённый", "ogr")
+    ras = QgsRasterLayer(tif, "Удалённый растр", "gdal")
+    alive = QgsVectorLayer(_geojson(os.path.join(root, "alive.geojson")), "Живой", "ogr")
+    p.addMapLayers([vec, ras, alive])
+    assert vec.featureCount() == 1
+    assert p.write(os.path.join(root, "Удалённые.qgz"))
+    items, _ = saver.find_layers(p, temporary_only=False)
+    assert len(items) == 3
+
+    for path in (gpkg, tif):
+        os.remove(path)
+    assert vec.isValid() and ras.isValid()  # QGIS не замечает удаления
+    items, skipped = saver.find_layers(p, temporary_only=False)
+    assert [l.name() for l, *_ in items] == ["Живой"], items
+    reasons = {l.name(): reason for l, reason in skipped}
+    assert "удалён" in reasons.get("Удалённый", "") and "удалён" in reasons.get("Удалённый растр", ""), reasons
+    res = packager.consolidate_project(p, items, "gpkg", include_fonts=False, make_archive=False)
+    assert [r["name"] for r in res["results"]] == ["Живой"], res["results"]
+    assert sorted(res["excluded"]) == ["Удалённый", "Удалённый растр"], res["excluded"]
+
+
 def test_joins_relations_expressions():
     """Объединения, связи, выражения и подписи переживают замену и не задваиваются."""
     from qgis.core import (QgsField, QgsPalLayerSettings, QgsRelation,
@@ -831,13 +1687,13 @@ def test_dialog():
     assert d.windowTitle() == "Сохранение временных слоёв", d.windowTitle()
     # два режима: временные слои и сборка в data_all; «Создать архив» — только у сборки
     assert sorted(d._radios) == [dlg_mod.MODE_PACKAGE, dlg_mod.MODE_TEMP] and not hasattr(d, "mode_all")
-    assert not hasattr(d, "structure")
+    assert not hasattr(d, "structure") and d.pkg_structure.text() == "Сохранять структуру папок"
     d.mode_package.setChecked(True)
-    assert d.layers_box.title() == "Слои проекта" and d.pkg_archive.isEnabled()
+    assert d.layers_box.title() == "Слои проекта" and d.pkg_archive.isEnabled() and d.pkg_structure.isEnabled()
     assert [it.text().split("   ")[0] for it in d._items()][-1] == "Постоянный"
     assert len(list(d._items())) == 6
     d.mode_temp.setChecked(True)
-    assert d.replace.isChecked() and not d.pkg_archive.isEnabled()
+    assert d.replace.isChecked() and not d.pkg_archive.isEnabled() and not d.pkg_structure.isEnabled()
     items = list(d._items())
     assert len(items) == 5
     items[0].setCheckState(dlg_mod.UNCHECKED)

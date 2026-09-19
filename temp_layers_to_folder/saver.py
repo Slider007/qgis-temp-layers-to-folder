@@ -77,6 +77,25 @@ def layer_path(layer):
     return path if os.path.isfile(path) else ""
 
 
+def _uri_path(layer):
+    try:
+        return QgsProviderRegistry.instance().decodeUri(layer.providerType(), layer.source()).get("path") or ""
+    except Exception:
+        return ""
+
+
+def missing_file(layer):
+    """Путь к файлу слоя, которого уже нет на диске, иначе пустая строка.
+
+    Такой слой может выглядеть исправным: удалённый файл читается через
+    открытый дескриптор, пока проект открыт. Растры и картинки при этом
+    теряются, поэтому сохранять и собирать такой слой нельзя."""
+    path = _uri_path(layer)
+    if not path or path.startswith("/vsi") or not os.path.isabs(path):
+        return ""
+    return "" if os.path.exists(path) else path
+
+
 def _processing_temp_dir():
     try:
         return os.path.realpath(QgsProcessingUtils.tempFolder())
@@ -104,17 +123,25 @@ def _is_temporary(layer, processing_dir):
 
 _ONLINE_PROVIDERS = {"wms": "WMS/XYZ", "wcs": "WCS", "arcgismapserver": "ArcGIS"}
 
+# Облака точек и сетки в другие форматы не переводятся: их файлы только
+# копируются как есть — при сборке со структурой папок (copier).
+_AS_IS_TYPES = {"QgsPointCloudLayer": ("pointcloud", "облако точек"),
+                "QgsMeshLayer": ("mesh", "сетка (mesh)")}
+
 _UNSUPPORTED_TYPES = {
-    "QgsMeshLayer": "сетка (mesh) — сохранить нельзя",
-    "QgsPointCloudLayer": "облако точек — сохранить нельзя",
     "QgsVectorTileLayer": "векторные тайлы — сохранить нельзя",
     "QgsTiledSceneLayer": "3D-сцена — сохранить нельзя",
 }
 
 
-def classify(layer, processing_dir=None):
-    """(kind, temporary, reason): kind — 'memory', 'vector' или 'raster';
-    если слой сохранить нельзя, kind = None, а reason объясняет почему."""
+_FILE_GONE = "файл слоя удалён или перемещён — сохранить нельзя"
+
+
+def classify(layer, processing_dir=None, copy_as_is=False):
+    """(kind, temporary, reason): kind — 'memory', 'vector' или 'raster', а с
+    copy_as_is (сборка со структурой папок) ещё 'pointcloud' и 'mesh' — их
+    файлы копируются как есть; если слой сохранить нельзя, kind = None, а
+    reason объясняет почему."""
     if processing_dir is None:
         processing_dir = _processing_temp_dir()
     if isinstance(layer, QgsVectorLayer):
@@ -122,6 +149,8 @@ def classify(layer, processing_dir=None):
             return "memory", True, ""
         if not layer.isValid():
             return None, False, "слой недоступен — источник не найден"
+        if missing_file(layer):
+            return None, False, _FILE_GONE
         return "vector", _is_temporary(layer, processing_dir), ""
     if isinstance(layer, QgsRasterLayer):
         if not layer.isValid():
@@ -129,16 +158,30 @@ def classify(layer, processing_dir=None):
         if layer.providerType() != "gdal":
             prov = _ONLINE_PROVIDERS.get(layer.providerType(), layer.providerType().upper())
             return None, False, "онлайн-слой {} — сохранить нельзя".format(prov)
+        if missing_file(layer):
+            return None, False, _FILE_GONE
         return "raster", _is_temporary(layer, processing_dir), ""
+    as_is = _AS_IS_TYPES.get(type(layer).__name__)
+    if as_is:
+        kind, label = as_is
+        if not layer.isValid():
+            return None, False, "слой недоступен — источник не найден"
+        if re.match(r"(?i)^https?://", _uri_path(layer)):
+            return None, False, "онлайн-слой ({}) — сохранить нельзя".format(label)
+        if missing_file(layer):
+            return None, False, _FILE_GONE
+        if not copy_as_is:
+            return None, False, "{} — только со структурой папок".format(label)
+        return kind, False, ""
     return None, False, _UNSUPPORTED_TYPES.get(type(layer).__name__, "этот тип слоя не поддерживается")
 
 
-def find_layers(project, temporary_only=True):
+def find_layers(project, temporary_only=True, copy_as_is=False):
     """Слои проекта в порядке панели «Слои».
 
     Возвращает (items, skipped): items = [(layer, kind, temporary)] — что можно
     сохранить; skipped = [(layer, причина)] — что сохранить нельзя (только для
-    режима «все слои»).
+    режима «все слои»). copy_as_is — см. classify.
     """
     processing_dir = _processing_temp_dir()
     ordered = [n.layer() for n in project.layerTreeRoot().findLayers() if n.layer()]
@@ -147,7 +190,7 @@ def find_layers(project, temporary_only=True):
 
     items, skipped = [], []
     for layer in ordered:
-        kind, temporary, reason = classify(layer, processing_dir)
+        kind, temporary, reason = classify(layer, processing_dir, copy_as_is)
         if temporary_only:
             if kind and temporary:
                 items.append((layer, kind, temporary))
@@ -177,6 +220,10 @@ def describe(layer, kind, temporary):
     if temporary:
         return "временный растр" if kind == "raster" else "временный файл"
     ext = os.path.splitext(layer_path(layer))[1].lower()
+    if kind == "pointcloud":
+        return "облако точек " + ("EPT" if layer.providerType() == "ept" else ext)
+    if kind == "mesh":
+        return "сетка " + ext
     if kind == "raster":
         return "растр " + ext if ext else "растр"
     if layer.providerType() == "ogr":
@@ -189,11 +236,35 @@ def _source_files(project):
     return {os.path.realpath(p) for p in (layer_path(l) for l in project.mapLayers().values()) if p}
 
 
+def relative_inside(folder, anchor):
+    """Путь folder относительно anchor, если folder лежит внутри anchor, иначе None.
+    Сначала как записано (ссылки на папки не раскрываются), затем через realpath:
+    на macOS /var и /private/var — одна папка."""
+    for norm in (lambda p: os.path.normpath(os.path.abspath(p)), os.path.realpath):
+        a, f = norm(anchor), norm(folder)
+        try:
+            if os.path.normcase(os.path.commonpath([a, f])) == os.path.normcase(a):
+                return os.path.relpath(f, a)
+        except ValueError:  # разные диски в Windows
+            pass
+    return None
+
+
 # ---------------------------------------------------------------- имена
 
 def safe_name(name):
     name = _INVALID_CHARS.sub("_", name or "").strip().strip(".")
     return (name or "layer")[:120]
+
+
+# GDAL не создаёт в GeoPackage таблицу, имя которой начинается с этих знаков
+# («- поворотные точки»): «The layer name may not contain special characters».
+_GPKG_BAD_START = "`~!@#$%^&*()+-={}|[]\\:\";'<>?,./ "
+
+
+def gpkg_layer_name(name):
+    """Имя таблицы в GeoPackage: без знаков препинания в начале."""
+    return name.lstrip(_GPKG_BAD_START) or "layer"
 
 
 def _existing_gpkg_layers(path):
@@ -241,6 +312,8 @@ def _fid_layer_options(layer, driver):
 
 def _write_vector(layer, path, driver, layer_name, action, transform_context, ct=None,
                   own_fields_only=False):
+    if driver == "GPKG":
+        layer_name = gpkg_layer_name(layer_name)
     opts = QgsVectorFileWriter.SaveVectorOptions()
     opts.driverName = driver
     opts.fileEncoding = "UTF-8"
@@ -262,13 +335,27 @@ def _write_vector(layer, path, driver, layer_name, action, transform_context, ct
     if layer_options:
         opts.layerOptions = layer_options
 
+    created = action == CREATE_FILE and not os.path.exists(path)
     res = QgsVectorFileWriter.writeAsVectorFormatV3(layer, path, transform_context, opts)
     error, message = res[0], res[1]
     new_file = res[2] if len(res) > 2 and res[2] else path
     new_layer = res[3] if len(res) > 3 and res[3] else layer_name
     if error != WRITER_OK:
+        if created:  # пустой файл от неудачной записи не оставляем
+            _remove_file_set(path, driver)
         raise RuntimeError(message or "ошибка записи (код {})".format(error))
     return new_file, new_layer
+
+
+def _remove_file_set(path, driver):
+    if driver == "ESRI Shapefile":
+        stem = os.path.splitext(path)[0]
+        paths = [stem + p for p in _SHP_PARTS if p != ".qml"]
+    else:
+        paths = [path + s for s in ("", "-wal", "-shm", "-journal")]
+    for p in paths:
+        if os.path.isfile(p):
+            os.remove(p)
 
 
 def _raster_stem(dest_folder, base, ext, overwrite, taken, protected):
@@ -391,9 +478,12 @@ def _repoint(layer, uri, provider, project, crs=None):
 
 def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 replace=True, save_styles=True, overwrite=False, crs=None,
-                progress=None, is_cancelled=None, own_fields_only=None):
+                progress=None, is_cancelled=None, own_fields_only=None, subdirs=None, names=None):
     """Сохраняет слои items = [(layer, kind, temporary), ...] в папку folder.
 
+    subdirs — {id слоя: подпапка внутри folder} (см. copier.target_subdir); слои
+    без подпапки и общий GeoPackage ложатся в саму folder. names — {id слоя: имя
+    файла без расширения} вместо названия слоя.
     crs — система координат для сохранения; None / недействительная — как у слоя.
     Исходные данные постоянных слоёв не меняются: правки из режима
     редактирования попадают только в копию, а файлы, из которых читают слои
@@ -414,8 +504,13 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
     tc = project.transformContext()
     protected = _source_files(project)
 
+    subdirs = subdirs or {}
+    taken_by_dir = {}  # {папка: занятые в этом запуске имена (в нижнем регистре)}
+
+    def taken_in(dest):
+        return taken_by_dir.setdefault(os.path.normcase(os.path.abspath(dest)), set())
+
     single_path = ""
-    taken = set()  # занятые в этом запуске имена (в нижнем регистре)
     if fmt["single"]:
         gpkg_file = safe_name(gpkg_name)
         if not gpkg_file.lower().endswith(".gpkg"):
@@ -423,7 +518,7 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
         single_path = os.path.join(folder, gpkg_file)
         if not overwrite or os.path.realpath(single_path) in protected:
             # в этот GeoPackage смотрят слои проекта — его таблицы не трогаем
-            taken |= _existing_gpkg_layers(single_path)
+            taken_in(folder).update(_existing_gpkg_layers(single_path))
 
     results = []
     total = len(items)
@@ -433,7 +528,10 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
         name = layer.name()
         if progress:
             progress(i, total, name)
-        base = safe_name(name)
+        base = safe_name((names or {}).get(layer.id()) or name)
+        sub = subdirs.get(layer.id())
+        dest = os.path.join(folder, sub) if sub else folder
+        taken = taken_in(dest)
         res = {"id": layer.id(), "name": name, "ok": False, "path": "", "message": "",
                "uri": "", "provider": "", "crs": None}
         notes = []
@@ -460,7 +558,8 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
             res["crs"] = target
 
             if kind == "raster":
-                path, stem = _save_raster(layer, folder, base, overwrite, taken, protected, target)
+                os.makedirs(dest, exist_ok=True)
+                path, stem = _save_raster(layer, dest, base, overwrite, taken, protected, target)
                 taken.add(stem.lower())
                 if save_styles:
                     layer.saveNamedStyle(os.path.splitext(path)[0] + ".qml")
@@ -470,8 +569,9 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 res.update(ok=True, path=path)
 
             elif fmt["single"]:
-                layer_name = _unique(base, lambda c: c.lower() in taken)
-                taken.add(layer_name.lower())
+                tables = taken_in(folder)  # общий GeoPackage — в корне, без подпапок
+                layer_name = _unique(gpkg_layer_name(base), lambda c: c.lower() in tables)
+                tables.add(layer_name.lower())
                 action = CREATE_LAYER if os.path.exists(single_path) else CREATE_FILE
                 new_file, new_layer = _write_vector(layer, single_path, driver, layer_name, action, tc, ct,
                                                     own_fields_only=own_only)
@@ -494,14 +594,15 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 def is_taken(c):
                     if c.lower() in taken:
                         return True
-                    paths = [os.path.join(folder, c + p) for p in parts]
+                    paths = [os.path.join(dest, c + p) for p in parts]
                     if any(os.path.realpath(p) in protected for p in paths):
                         return True  # из этого файла читает слой проекта
                     return not overwrite and any(os.path.exists(p) for p in paths)
 
                 stem = _unique(base, is_taken)
                 taken.add(stem.lower())
-                path = os.path.join(folder, stem + "." + ext)
+                os.makedirs(dest, exist_ok=True)
+                path = os.path.join(dest, stem + "." + ext)
                 new_file, new_layer = _write_vector(layer, path, driver, stem, CREATE_FILE, tc, ct,
                                                     own_fields_only=own_only)
                 if not os.path.exists(new_file):

@@ -25,10 +25,11 @@ from qgis.PyQt.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSizePolicy,
+    QStyle,
     QVBoxLayout,
 )
 
-from . import packager, saver
+from . import copier, packager, saver
 
 SETTINGS = "temp_layers_to_folder/"
 MODE_TEMP, MODE_PACKAGE = "temp", "package"
@@ -71,6 +72,22 @@ class SaveTempLayersDialog(QDialog):
         self.pkg_archive = QCheckBox("Создать архив")
         self.pkg_archive.setToolTip("Рядом с проектом появится архив «<проект>_архив_<дата>.zip»: "
                                     "проект, data_all и «Состав.txt» — для передачи заказчику.")
+        self.pkg_structure = QCheckBox("Сохранять структуру папок")
+        self.pkg_structure.setToolTip(
+            "Файлы слоёв копируются как есть, со всеми сопутствующими файлами, по тем же "
+            "подпапкам:\n"
+            "• «data/ЛЕС/лес.shp» → «data_all/ЛЕС/лес.shp»;\n"
+            "• файл прямо в папке проекта → «data_all/<имя>»;\n"
+            "• другая папка проекта → «data_all/<путь от папки проекта>»;\n"
+            "• файл вне проекта → «data_all/external_links/<последние 3 папки пути>» "
+            "(от домашней папки или от диска).\n"
+            + ("Растры, облака точек и сетки — по тем же правилам, но в data_all/raster, "
+               "data_all/pointcloud и data_all/mesh.\n" if copier.SPLIT_BY_TYPE else "")
+            + "GeoPackage и другие файлы с несколькими слоями копируются один раз"
+            + ("; если в файле и растр, и вектор — в общую структуру" if copier.SPLIT_BY_TYPE else "")
+            + ". Формат из окна — только для слоёв в памяти и из баз (в саму data_all), для VRT "
+            "и при смене системы координат. Облака точек и сетки собираются только так. "
+            "Значки — в data_all/symbols.")
         self._radios = {MODE_TEMP: self.mode_temp, MODE_PACKAGE: self.mode_package}
         mode_col = QVBoxLayout()
         mode_col.addWidget(self.mode_temp)
@@ -82,6 +99,15 @@ class SaveTempLayersDialog(QDialog):
         package_row.addWidget(self.pkg_archive)
         package_row.addStretch()
         mode_col.addLayout(package_row)
+        # второй параметр сборки — под её переключателем, вровень с его текстом
+        style = self.style()
+        indent = (style.pixelMetric(QStyle.PixelMetric.PM_ExclusiveIndicatorWidth)
+                  + style.pixelMetric(QStyle.PixelMetric.PM_RadioButtonLabelSpacing))
+        structure_row = QHBoxLayout()
+        structure_row.addSpacing(indent)
+        structure_row.addWidget(self.pkg_structure)
+        structure_row.addStretch()
+        mode_col.addLayout(structure_row)
         form.addRow("Режим:", mode_col)
 
         self.folder = QgsFileWidget()
@@ -194,6 +220,8 @@ class SaveTempLayersDialog(QDialog):
         self._apply_mode()
         for radio in self._radios.values():
             radio.toggled.connect(self._mode_changed)
+        # со структурой папок в списке появляются облака точек и сетки
+        self.pkg_structure.toggled.connect(self.refresh)
         self.refresh()
 
     # ------------------------------------------------------------ настройки
@@ -213,6 +241,7 @@ class SaveTempLayersDialog(QDialog):
         self._mode = mode if mode in self._radios else MODE_TEMP  # бывший режим «все слои» — к временным
         self._radios[self._mode].setChecked(True)
         self.pkg_archive.setChecked(_bool(s.value(SETTINGS + "pkg_archive"), True))
+        self.pkg_structure.setChecked(_bool(s.value(SETTINGS + "keep_structure"), False))
         self.pkg_fonts.setChecked(_bool(s.value(SETTINGS + "pkg_fonts"), True))
         self.styles.setChecked(_bool(s.value(SETTINGS + "styles"), True))
         self.overwrite.setChecked(_bool(s.value(SETTINGS + "overwrite"), False))
@@ -232,6 +261,7 @@ class SaveTempLayersDialog(QDialog):
         s.setValue(SETTINGS + "gpkg_name", self.gpkg_name.text())
         s.setValue(SETTINGS + "mode", self._mode)
         s.setValue(SETTINGS + "pkg_archive", self.pkg_archive.isChecked())
+        s.setValue(SETTINGS + "keep_structure", self.pkg_structure.isChecked())
         s.setValue(SETTINGS + "pkg_fonts", self.pkg_fonts.isChecked())
         s.setValue(SETTINGS + "replace", self.replace.isChecked())
         s.remove(SETTINGS + "replace_all")  # от режима «все слои», убранного в 1.6.0
@@ -245,6 +275,7 @@ class SaveTempLayersDialog(QDialog):
     def _apply_mode(self):
         package = self._mode == MODE_PACKAGE
         self.pkg_archive.setEnabled(package)
+        self.pkg_structure.setEnabled(package)
         # при сборке слои всегда переключаются, а папка — data_all рядом с проектом
         self.replace.setVisible(not package)
         self.overwrite.setVisible(not package)
@@ -274,14 +305,20 @@ class SaveTempLayersDialog(QDialog):
             self.package_hint.setText("Проект ещё не сохранён — сначала будет предложено сохранить его: "
                                       "папка data_all появится рядом с файлом проекта.")
             return
-        text = "Слои скопируются в «{}», проект переключится на них и сохранится.".format(
-            packager.data_dir(self.project))
+        if self.pkg_structure.isChecked():
+            text = ("Файлы слоёв скопируются в «{}» как есть, по тем же подпапкам, что и исходные; "
+                    "проект переключится на них и сохранится.").format(packager.data_dir(self.project))
+        else:
+            text = "Слои скопируются в «{}», проект переключится на них и сохранится.".format(
+                packager.data_dir(self.project))
         if self.pkg_archive.isChecked():
             text += " Рядом с проектом появится архив «{}.zip».".format(packager.archive_name(self.project))
         self.package_hint.setText(text)
 
     def _find(self):
-        return saver.find_layers(self.project, temporary_only=self._mode == MODE_TEMP)
+        if self._mode == MODE_PACKAGE:
+            return packager.find_layers(self.project, self.pkg_structure.isChecked())
+        return saver.find_layers(self.project, temporary_only=True)
 
     def busy(self):
         return self._busy
@@ -296,7 +333,8 @@ class SaveTempLayersDialog(QDialog):
         self.layers.addItem(item)
         return item
 
-    def refresh(self):
+    def refresh(self, *_):
+        unchecked = {it.data(ROLE_ID) for it in self._items() if it.checkState() != CHECKED}
         self.layers.blockSignals(True)
         self.layers.clear()
         items, skipped = self._find()
@@ -304,7 +342,7 @@ class SaveTempLayersDialog(QDialog):
             item = self._add_item(layer, saver.describe(layer, kind, temporary))
             item.setData(ROLE_ID, layer.id())
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(CHECKED)
+            item.setCheckState(UNCHECKED if layer.id() in unchecked else CHECKED)
         for layer, reason in skipped:  # видно, но выбрать нельзя
             item = self._add_item(layer, reason, "{}   — {}")
             item.setFlags(Qt.ItemFlag.NoItemFlags)
@@ -433,6 +471,21 @@ class SaveTempLayersDialog(QDialog):
                     len(items), packager.data_dir(self.project))
         if crs.isValid():
             text += "\n\nСистема координат слоёв и проекта: {}.".format(crs.authid() or crs.description())
+        structure = self.pkg_structure.isChecked()
+        if structure:
+            text += ("\n\nФайлы копируются как есть, по тем же подпапкам: data/… → data_all/…, "
+                     "другие папки проекта — с тем же путём, файлы вне папки проекта — в "
+                     "data_all/external_links/.")
+            if copier.SPLIT_BY_TYPE:
+                text += (" Растры, облака точек и сетки — так же, но в data_all/raster/, "
+                         "data_all/pointcloud/ и data_all/mesh/.")
+            text += " Слои в памяти и из баз — в выбранном формате в саму data_all."
+            flat = packager.flat_in_data_dir(self.project, items)
+            if flat:
+                text += ("\n\nСлоёв, уже собранных в data_all без подпапок: {} — они останутся там же. "
+                         "Их исходные папки проекту больше не известны, поэтому разложить их "
+                         "по подпапкам нельзя. Нужна раскладка — соберите версию проекта, "
+                         "сохранённую до прошлой сборки.").format(len(flat))
         if self.pkg_archive.isChecked():
             text += "\n\nЗатем рядом с проектом будет собран архив «{}.zip».".format(
                 packager.archive_name(self.project))
@@ -448,7 +501,7 @@ class SaveTempLayersDialog(QDialog):
                 save_styles=self.styles.isChecked(), include_fonts=self.pkg_fonts.isChecked(),
                 save_project=lambda: self.iface.actionSaveProject().trigger(),
                 progress=self._on_progress, is_cancelled=lambda: self._cancel,
-                make_archive=self.pkg_archive.isChecked())
+                make_archive=self.pkg_archive.isChecked(), keep_structure=structure)
         except saver.Cancelled:
             self.log.appendPlainText("Отменено. Часть слоёв могла уже переключиться на data_all — "
                                      "проект не сохранён, можно закрыть его без сохранения.")
@@ -489,7 +542,8 @@ class SaveTempLayersDialog(QDialog):
         if pkg["already"]:
             self.log.appendPlainText("Уже были в data_all: " + ", ".join(pkg["already"]))
         if pkg["images"]:
-            self.log.appendPlainText("Свои картинки в data_all/images: {}".format(len(pkg["images"])))
+            self.log.appendPlainText("Свои картинки: {} шт. {}".format(
+                len(pkg["images"]), pkg["images_where"] or "в data_all/images"))
         fonts = pkg["fonts"]
         if fonts["free"]:
             self.log.appendPlainText("Шрифты в data_all/fonts: " + ", ".join(sorted(fonts["free"])))
@@ -543,6 +597,7 @@ class SaveTempLayersDialog(QDialog):
                 self.overwrite, self.btn_save):
             w.setEnabled(enabled)
         self.pkg_archive.setEnabled(enabled and self._mode == MODE_PACKAGE)
+        self.pkg_structure.setEnabled(enabled and self._mode == MODE_PACKAGE)
         self.btn_close.setText("Закрыть" if enabled else "Отмена")
         if enabled:
             self._update_count()

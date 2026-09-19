@@ -336,150 +336,6 @@ def test_all_layers_replace():
     assert os.path.exists(gj), "исходный файл должен остаться на месте"
 
 
-def _geojson(path, x=39.1):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as fh:
-        fh.write('{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"n":1},'
-                 '"geometry":{"type":"Point","coordinates":[%s,48.5]}}]}' % x)
-    return path
-
-
-def structure_project(root):
-    """Проект в root/Проект, данные в его подпапках и во внешней папке root/Архив.
-    Два слоя «Слой» с одинаковым именем — в разных подпапках."""
-    p = QgsProject.instance()
-    p.clear()
-    shutil.rmtree(root, ignore_errors=True)
-    proj_dir = os.path.join(root, "Проект")
-    tif = os.path.join(proj_dir, "Данные", "Растры", "dem.tif")
-    os.makedirs(os.path.dirname(tif))
-    ds = gdal.GetDriverByName("GTiff").Create(tif, 10, 10, 1, gdal.GDT_Int16)
-    ds.SetGeoTransform([39.0, 0.01, 0, 48.8, 0, -0.01])
-    sr = osr.SpatialReference()
-    sr.ImportFromEPSG(4326)
-    ds.SetProjection(sr.ExportToWkt())
-    ds.GetRasterBand(1).Fill(120)
-    ds = None
-    layers = {
-        "opory": QgsVectorLayer(_geojson(os.path.join(proj_dir, "Данные", "Вектор", "Опоры.geojson")),
-                                "Опоры", "ogr"),
-        "dem": QgsRasterLayer(tif, "Рельеф", "gdal"),
-        "top": QgsVectorLayer(_geojson(os.path.join(proj_dir, "Карта.geojson")), "Карта", "ogr"),
-        "topo": QgsVectorLayer(_geojson(os.path.join(root, "Архив", "Топо", "a.geojson")), "Слой", "ogr"),
-        "soil": QgsVectorLayer(_geojson(os.path.join(root, "Архив", "Почвы", "b.geojson"), 39.2), "Слой", "ogr"),
-        "mem": QgsVectorLayer("Point?crs=EPSG:4326", "Черновик", "memory"),
-    }
-    assert all(l.isValid() for l in layers.values())
-    p.addMapLayers(list(layers.values()))
-    return p, proj_dir, layers
-
-
-def test_keep_structure():
-    """«Сохранять структуру папок»: файлы ложатся в те же подпапки, что и исходные."""
-    root = os.path.join(OUT, "struct")
-    p, proj_dir, L = structure_project(root)
-    items, _ = saver.find_layers(p, temporary_only=False)
-    out = os.path.join(OUT, "struct_out")
-    sub = saver.structure_subdirs(items, [out, proj_dir])
-    j = os.path.join
-    assert sub == {L["opory"].id(): j("Данные", "Вектор"), L["dem"].id(): j("Данные", "Растры"),
-                   L["topo"].id(): j("Архив", "Топо"), L["soil"].id(): j("Архив", "Почвы")}, sub
-
-    res = saver.save_layers(p, items, out, "gpkg", replace=True, subdirs=sub)
-    assert all(r["ok"] for r in res), res
-    for rel in ("Данные/Вектор/Опоры.gpkg", "Данные/Растры/Рельеф.tif", "Карта.gpkg",
-                "Архив/Топо/Слой.gpkg", "Архив/Почвы/Слой.gpkg", "Черновик.gpkg"):
-        assert os.path.isfile(j(out, rel)), (rel, res)  # одноимённые слои в разных папках — без _2
-    assert L["soil"].source().startswith(j(out, "Архив", "Почвы", "Слой.gpkg")), L["soil"].source()
-    assert L["dem"].source() == j(out, "Данные", "Растры", "Рельеф.tif")
-
-    # один GeoPackage на все слои: векторы — в нём, растры — по подпапкам
-    p, proj_dir, L = structure_project(root)
-    items, _ = saver.find_layers(p, temporary_only=False)
-    out = os.path.join(OUT, "struct_single")
-    res = saver.save_layers(p, items, out, "gpkg_single", gpkg_name="все", replace=False,
-                            subdirs=saver.structure_subdirs(items, [out, proj_dir]))
-    assert all(r["ok"] for r in res), res
-    listing = sorted(n for n in os.listdir(out) if not n.endswith(("-wal", "-shm")))
-    assert listing == ["Данные", "все.gpkg"], listing
-    assert os.path.isfile(j(out, "Данные", "Растры", "Рельеф.tif"))
-    tables = saver._existing_gpkg_layers(j(out, "все.gpkg")) - {"layer_styles"}
-    assert sorted(tables) == ["карта", "опоры", "слой", "слой_2", "черновик"], tables
-
-
-def test_keep_structure_package():
-    """Сборка с сохранением структуры: data_all повторяет подпапки проекта, архив тоже;
-    повторная сборка в другой СК оставляет файл в его подпапке data_all."""
-    import zipfile
-
-    from temp_layers_to_folder import packager
-
-    root = os.path.join(OUT, "struct_pkg")
-    p, proj_dir, L = structure_project(root)
-    proj = os.path.join(proj_dir, "Структура.qgz")
-    assert p.write(proj)
-    items, _ = saver.find_layers(p, temporary_only=False)
-    res = packager.consolidate_project(p, items, "gpkg", include_fonts=False, keep_structure=True)
-    data = os.path.join(proj_dir, "data_all")
-    for rel in ("Данные/Вектор/Опоры.gpkg", "Данные/Растры/Рельеф.tif", "Карта.gpkg",
-                "Архив/Топо/Слой.gpkg", "Архив/Почвы/Слой.gpkg", "Черновик.gpkg"):
-        assert os.path.isfile(os.path.join(data, rel)), rel
-    assert L["opory"].source().startswith(os.path.join(data, "Данные", "Вектор")), L["opory"].source()
-    names = zipfile.ZipFile(res["zip"]).namelist()
-    top = os.path.splitext(os.path.basename(res["zip"]))[0] + "/"
-    assert top + "data_all/Данные/Растры/Рельеф.tif" in names, names
-    readme = zipfile.ZipFile(res["zip"]).read(top + "Состав.txt").decode("utf-8-sig")
-    assert "Опоры — data_all/Данные/Вектор/Опоры.gpkg" in readme, readme
-
-    res2 = packager.consolidate_project(p, [(L["opory"], "vector", False)], "gpkg", crs=UTM37,
-                                        include_fonts=False, keep_structure=True)
-    assert res2["results"][0]["ok"], res2["results"]
-    assert L["opory"].source().startswith(os.path.join(data, "Данные", "Вектор", "Опоры_2.gpkg")), \
-        L["opory"].source()
-    assert not os.path.exists(os.path.join(data, "data_all"))
-
-
-def test_keep_structure_dialog():
-    from qgis.PyQt.QtWidgets import QMainWindow, QMessageBox
-
-    from temp_layers_to_folder import dialog as dlg_mod
-
-    class Bar:
-        def pushMessage(self, *a, **k): pass
-
-    class Iface:
-        def __init__(self):
-            self.w, self.bar = QMainWindow(), Bar()
-
-        def mainWindow(self): return self.w
-        def messageBar(self): return self.bar
-
-    root = os.path.join(OUT, "struct_dlg")
-    p, proj_dir, L = structure_project(root)
-    assert p.write(os.path.join(proj_dir, "Окно.qgz"))
-    iface = Iface()
-    d = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
-    d.mode_temp.setChecked(True)
-    assert d.structure.isHidden()  # у временных слоёв нет исходных папок
-    d.mode_package.setChecked(True)
-    assert not d.structure.isHidden()
-    d.mode_all.setChecked(True)
-    assert not d.structure.isHidden()
-    out = os.path.join(root, "Выгрузка")
-    d.folder.setFilePath(out)
-    d.structure.setChecked(True)
-    d.replace.setChecked(False)
-    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
-    d.run()
-    assert os.path.isfile(os.path.join(out, "Данные", "Вектор", "Опоры.gpkg")), d.log.toPlainText()
-    assert "Данные/Растры/Рельеф.tif" in d.log.toPlainText().replace(os.sep, "/")
-    d.close()
-    d2 = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
-    assert d2.structure.isChecked(), "выбор должен запоминаться"
-    d2.structure.setChecked(False)
-    d2._save_settings()
-
-
 def _font_by_license(kind):
     """Файл системного шрифта с нужным видом лицензии и его семейство."""
     from temp_layers_to_folder import fonts
@@ -697,7 +553,7 @@ def test_dialog_package():
     iface = Iface()
     d = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
     d.mode_package.setChecked(True)
-    assert d.btn_save.text() == "Собрать" and d.layers_box.title() == "Слои для передачи"
+    assert d.btn_save.text() == "Собрать" and d.layers_box.title() == "Слои проекта"
     assert d.replace.isHidden() and d.overwrite.isHidden() and d.folder.isHidden()
     assert "ещё не сохранён" in d.package_hint.text() and d.btn_open.isHidden()
     assert len(list(d._items())) == 6  # все слои проекта
@@ -732,6 +588,69 @@ def test_dialog_package():
     assert "Архив:" in d.log.toPlainText() and not d.btn_open.isHidden()
     assert iface.bar.messages[-1][0] == "Сборка проекта"
     assert saver.find_temporary_layers(p) == [], "временные слои должны переехать в data_all"
+
+
+def test_dialog_package_without_archive():
+    """«Создать архив» выключен: слои собраны в data_all, проект сохранён, архива нет."""
+    from qgis.PyQt.QtWidgets import QMainWindow, QMessageBox
+
+    from temp_layers_to_folder import dialog as dlg_mod
+
+    p = make_project()
+    folder = os.path.join(OUT, "Только data_all")
+    os.makedirs(folder, exist_ok=True)
+    proj = os.path.join(folder, "Сборка.qgz")
+    assert p.write(proj)
+
+    class Bar:
+        messages = []
+
+        def pushMessage(self, *a, **k):
+            self.messages.append(a)
+
+    class SaveAction:
+        def trigger(self):
+            p.write()
+
+    class Iface:
+        def __init__(self):
+            self.w, self.bar = QMainWindow(), Bar()
+
+        def mainWindow(self): return self.w
+        def messageBar(self): return self.bar
+        def actionSaveProject(self): return SaveAction()
+
+    iface = Iface()
+    d = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
+    d.mode_package.setChecked(True)
+    d.pkg_archive.setChecked(False)
+    d.pkg_fonts.setChecked(False)
+    assert "архив" not in d.package_hint.text(), d.package_hint.text()
+    asked = []
+
+    def yes(*a, **k):
+        asked.append(a[2] if len(a) > 2 else "")
+        return QMessageBox.StandardButton.Yes
+
+    QMessageBox.question = staticmethod(yes)
+    d.run()
+    data = os.path.join(folder, "data_all")
+    assert os.path.isfile(os.path.join(data, "Постоянный.gpkg")), d.log.toPlainText()
+    assert not [n for n in os.listdir(folder) if n.endswith(".zip")], os.listdir(folder)
+    assert not [n for n in os.listdir(folder) if n.startswith(".")], "временная копия проекта"
+    assert "архив" not in asked[-1] and "Архив:" not in d.log.toPlainText(), (asked, d.log.toPlainText())
+    assert iface.bar.messages[-1][1] == "Готово: слои собраны в data_all", iface.bar.messages[-1]
+    assert not p.isDirty() and saver.find_temporary_layers(p) == []
+    p2 = QgsProject()
+    assert p2.read(proj)
+    assert all(l.source().startswith(data) for l in p2.mapLayers().values()), \
+        [l.source() for l in p2.mapLayers().values()]
+    # выбор запоминается
+    d2 = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
+    assert d2.mode_package.isChecked() and not d2.pkg_archive.isChecked()
+    d2.pkg_archive.setChecked(True)
+    d2.mode_temp.setChecked(True)
+    d2._save_settings()
 
 
 def test_joins_relations_expressions():
@@ -906,12 +825,15 @@ def test_dialog():
     d = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
     d.folder.setFilePath(os.path.join(OUT, "dialog"))
     d.crs.setCrs(UTM37)
-    d.mode_all.setChecked(True)  # «все слои»: к пяти временным добавляется постоянный «Постоянный»
-    assert d.layers_box.title() == "Слои проекта" and not d.replace.isChecked()
+    # два режима: временные слои и сборка в data_all; «Создать архив» — только у сборки
+    assert sorted(d._radios) == [dlg_mod.MODE_PACKAGE, dlg_mod.MODE_TEMP] and not hasattr(d, "mode_all")
+    assert not hasattr(d, "structure")
+    d.mode_package.setChecked(True)
+    assert d.layers_box.title() == "Слои проекта" and d.pkg_archive.isEnabled()
     assert [it.text().split("   ")[0] for it in d._items()][-1] == "Постоянный"
     assert len(list(d._items())) == 6
     d.mode_temp.setChecked(True)
-    assert d.replace.isChecked()
+    assert d.replace.isChecked() and not d.pkg_archive.isEnabled()
     items = list(d._items())
     assert len(items) == 5
     items[0].setCheckState(dlg_mod.UNCHECKED)

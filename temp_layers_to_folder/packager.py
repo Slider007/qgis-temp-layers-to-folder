@@ -5,8 +5,8 @@
    свободной лицензией — в data_all/fonts. Слои проекта переключаются на эти
    копии, пути делаются относительными, проект сохраняется — после этого
    исходные файлы можно удалить.
-2. Рядом с проектом собирается архив «<проект>_архив_<ГГГГ-ММ-ДД>.zip»:
-   проект, data_all и «Состав.txt».
+2. По желанию рядом с проектом собирается архив
+   «<проект>_архив_<ГГГГ-ММ-ДД>.zip»: проект, data_all и «Состав.txt».
 """
 
 import datetime
@@ -340,12 +340,11 @@ def readme_text(name, crs, layers, online, excluded, font_info, images):
 
 def consolidate_project(project, items, fmt_key, crs=None, save_styles=True, include_fonts=True,
                         save_project=None, progress=None, is_cancelled=None, font_dirs=None,
-                        today=None, keep_structure=False):
-    """Собирает проект в data_all и делает архив. items — выбранные слои
-    [(layer, kind, temporary)]. save_project — как сохранить проект (в QGIS —
-    через стандартное действие «Сохранить»), по умолчанию project.write().
-    keep_structure — раскладывать файлы в data_all по тем же подпапкам, что и
-    исходные (относительно папки проекта), а не складывать в одну.
+                        today=None, make_archive=True):
+    """Собирает проект в data_all и, если make_archive, делает архив. items —
+    выбранные слои [(layer, kind, temporary)]. save_project — как сохранить
+    проект (в QGIS — через стандартное действие «Сохранить»), по умолчанию
+    project.write().
 
     Возвращает словарь с итогами.
     """
@@ -370,14 +369,10 @@ def consolidate_project(project, items, fmt_key, crs=None, save_styles=True, inc
         needs_crs = (use_crs is not None and layer.isSpatial() and layer.crs().isValid()
                      and layer.crs() != use_crs)
         (todo if not inside or needs_crs else already).append(item)
-    # слой, уже лежащий в data_all, остаётся в своей подпапке — поэтому data_all первой
-    subdirs = saver.structure_subdirs(todo, [target, os.path.dirname(project_file)]) \
-        if keep_structure else None
     results = saver.save_layers(
         project, todo, target, fmt_key, gpkg_name=project_base_name(project), replace=True,
         save_styles=save_styles, overwrite=False, crs=use_crs,
-        progress=lambda i, total, n: step(len(already) + i, n), is_cancelled=is_cancelled,
-        subdirs=subdirs)
+        progress=lambda i, total, n: step(len(already) + i, n), is_cancelled=is_cancelled)
 
     step(len(items), "картинки и проект")
     chosen = {layer.id() for layer, *_ in items}
@@ -395,7 +390,7 @@ def consolidate_project(project, items, fmt_key, crs=None, save_styles=True, inc
     if project.isDirty():
         raise RuntimeError("проект не сохранён — архив не собирался")
 
-    # 2. архив рядом с проектом
+    # 2. шрифты в data_all/fonts и архив рядом с проектом
     step(len(items) + 1, "шрифты")
     in_data = {l.id(): l for l in project.mapLayers().values()
                if saver._inside(saver.layer_path(l), real_target)}
@@ -407,23 +402,24 @@ def consolidate_project(project, items, fmt_key, crs=None, save_styles=True, inc
         font_info = fonts.find_fonts(used_font_families(project, set(in_data)), font_dirs)
         copy_fonts(font_info, os.path.join(target, FONTS_DIR))
 
-    step(len(items) + 2, "архив")
-    name = archive_name(project, today)
     folder = os.path.dirname(project_file)
-    zip_path = _unique_path(folder, name, ".zip")
-    root = os.path.splitext(os.path.basename(zip_path))[0]
-    base = project_base_name(project)
-    layers = sorted((l.name(), os.path.relpath(saver.layer_path(l), folder).replace(os.sep, "/"))
-                    for l in in_data.values())
-    readme = readme_text(base, use_crs, layers, sorted(online.values()), sorted(excluded),
-                         font_info, images)
-    copy_path = os.path.join(folder, ".{}.qgz".format(root))  # временная, рядом с проектом
-    try:
-        _archive_project_copy(project_file, set(in_data) | set(online), copy_path)
-        write_archive(zip_path, root, copy_path, base, target, readme)
-    finally:
-        if os.path.exists(copy_path):
-            os.remove(copy_path)
+    zip_path = ""
+    if make_archive:
+        step(len(items) + 2, "архив")
+        zip_path = _unique_path(folder, archive_name(project, today), ".zip")
+        root = os.path.splitext(os.path.basename(zip_path))[0]
+        base = project_base_name(project)
+        layers = sorted((l.name(), os.path.relpath(saver.layer_path(l), folder).replace(os.sep, "/"))
+                        for l in in_data.values())
+        readme = readme_text(base, use_crs, layers, sorted(online.values()), sorted(excluded),
+                             font_info, images)
+        copy_path = os.path.join(folder, ".{}.qgz".format(root))  # временная, рядом с проектом
+        try:
+            _archive_project_copy(project_file, set(in_data) | set(online), copy_path)
+            write_archive(zip_path, root, copy_path, base, target, readme)
+        finally:
+            if os.path.exists(copy_path):
+                os.remove(copy_path)
     step(steps, "")
     for r in results:
         r["rel"] = os.path.relpath(r["path"].split(" → ")[0], folder) if r["ok"] else ""

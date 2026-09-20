@@ -24,8 +24,6 @@ from qgis.PyQt.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
-    QSizePolicy,
-    QStyle,
     QVBoxLayout,
 )
 
@@ -69,45 +67,10 @@ class SaveTempLayersDialog(QDialog):
             "Слои, свои картинки и свободные шрифты копируются в папку data_all рядом с файлом "
             "проекта, проект переключается на них и сохраняется — исходные файлы можно удалить. "
             "Онлайн-слои (WMS, XYZ) остаются онлайн-слоями.")
-        self.pkg_archive = QCheckBox("Создать архив")
-        self.pkg_archive.setToolTip("Рядом с проектом появится архив «<проект>_архив_<дата>.zip»: "
-                                    "проект, data_all и «Состав.txt» — для передачи заказчику.")
-        self.pkg_structure = QCheckBox("Сохранять структуру папок")
-        self.pkg_structure.setToolTip(
-            "Файлы слоёв копируются как есть, со всеми сопутствующими файлами, по тем же "
-            "подпапкам:\n"
-            "• «data/ЛЕС/лес.shp» → «data_all/ЛЕС/лес.shp»;\n"
-            "• файл прямо в папке проекта → «data_all/<имя>»;\n"
-            "• другая папка проекта → «data_all/<путь от папки проекта>»;\n"
-            "• файл вне проекта → «data_all/external_links/<последние 3 папки пути>» "
-            "(от домашней папки или от диска).\n"
-            + ("Растры, облака точек и сетки — по тем же правилам, но в data_all/raster, "
-               "data_all/pointcloud и data_all/mesh.\n" if copier.SPLIT_BY_TYPE else "")
-            + "GeoPackage и другие файлы с несколькими слоями копируются один раз"
-            + ("; если в файле и растр, и вектор — в общую структуру" if copier.SPLIT_BY_TYPE else "")
-            + ". Формат из окна — только для слоёв в памяти и из баз (в саму data_all), для VRT "
-            "и при смене системы координат. Облака точек и сетки собираются только так. "
-            "Значки — в data_all/symbols.")
         self._radios = {MODE_TEMP: self.mode_temp, MODE_PACKAGE: self.mode_package}
         mode_col = QVBoxLayout()
         mode_col.addWidget(self.mode_temp)
-        # текст режима не сжимается: окно становится шире, чтобы уместить его и флажок
-        self.mode_package.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-        package_row = QHBoxLayout()
-        package_row.addWidget(self.mode_package)
-        package_row.addSpacing(12)
-        package_row.addWidget(self.pkg_archive)
-        package_row.addStretch()
-        mode_col.addLayout(package_row)
-        # второй параметр сборки — под её переключателем, вровень с его текстом
-        style = self.style()
-        indent = (style.pixelMetric(QStyle.PixelMetric.PM_ExclusiveIndicatorWidth)
-                  + style.pixelMetric(QStyle.PixelMetric.PM_RadioButtonLabelSpacing))
-        structure_row = QHBoxLayout()
-        structure_row.addSpacing(indent)
-        structure_row.addWidget(self.pkg_structure)
-        structure_row.addStretch()
-        mode_col.addLayout(structure_row)
+        mode_col.addWidget(self.mode_package)
         form.addRow("Режим:", mode_col)
 
         self.folder = QgsFileWidget()
@@ -119,6 +82,12 @@ class SaveTempLayersDialog(QDialog):
         self.format = QComboBox()
         for f in saver.FORMATS:
             self.format.addItem(f["label"], f["key"])
+        self.format.setToolTip(
+            "«Оставить родные форматы файлов» — файлы слоёв копируются как есть, со всеми "
+            "сопутствующими файлами (.shx, .dbf, .prj, .tfw, стили). GeoPackage и другие файлы с "
+            "несколькими слоями копируются один раз. Так собираются и облака точек с сетками. "
+            "Слои без файла (в памяти, из баз) сохраняются в GeoPackage, как и слои со сменой "
+            "системы координат.")
         form.addRow("Формат:", self.format)
 
         self.crs = QgsProjectionSelectionWidget()
@@ -169,10 +138,25 @@ class SaveTempLayersDialog(QDialog):
                                "при открытии файла стиль подхватится сам.")
         self.overwrite = QCheckBox("Перезаписывать существующие файлы")
         self.overwrite.setToolTip("Если выключено, к имени добавится _2, _3…")
+        self.pkg_structure = QCheckBox("Сохранять структуру папок")
+        self.pkg_structure.setToolTip(
+            "Файлы слоёв ложатся в data_all по тем же подпапкам, что и исходные:\n"
+            "• «data/ЛЕС/лес.shp» → «data_all/ЛЕС/лес.shp»;\n"
+            "• файл прямо в папке проекта → «data_all/<имя>»;\n"
+            "• другая папка проекта → «data_all/<путь от папки проекта>»;\n"
+            "• файл вне проекта → «data_all/external_links/<последние 3 папки пути>» "
+            "(от домашней папки или от диска).\n"
+            + ("Растры, облака точек и сетки — по тем же правилам, но в data_all/raster, "
+               "data_all/pointcloud и data_all/mesh.\n" if copier.SPLIT_BY_TYPE else "")
+            + "Без флажка всё ложится прямо в data_all. Слои в памяти и из баз — всегда в саму "
+            "data_all. Значки — в data_all/symbols.")
+        self.pkg_archive = QCheckBox("Создать архив для заказчика")
+        self.pkg_archive.setToolTip("Рядом с проектом появится архив «<проект>_архив_<дата>.zip»: "
+                                    "проект, data_all и «Состав.txt» — для передачи заказчику.")
         self.pkg_fonts = QCheckBox("Скопировать в data_all/fonts шрифты со свободной лицензией")
         self.pkg_fonts.setToolTip("Шрифты подписей, значков и макетов. Платные и шрифты без указанной "
                                   "лицензии не копируются — они перечисляются в «Состав.txt».")
-        self._pkg_widgets = (self.pkg_fonts,)
+        self._pkg_widgets = (self.pkg_structure, self.pkg_archive, self.pkg_fonts)
         for w in (self.replace, self.styles, self.overwrite) + self._pkg_widgets:
             root.addWidget(w)
         hint = QLabel("Растры сохраняются отдельными файлами независимо от выбранного формата: "
@@ -215,13 +199,15 @@ class SaveTempLayersDialog(QDialog):
         self.pkg_archive.toggled.connect(self._update_package_hint)
         self.format.currentIndexChanged.connect(self._format_changed)
 
+        self._mode = MODE_TEMP  # до чтения настроек: сигналы ниже уже спрашивают режим
         self._load_settings()
         self._format_changed()
         self._apply_mode()
         for radio in self._radios.values():
             radio.toggled.connect(self._mode_changed)
-        # со структурой папок в списке появляются облака точек и сетки
-        self.pkg_structure.toggled.connect(self.refresh)
+        # с родными форматами в списке появляются облака точек и сетки
+        self.format.currentIndexChanged.connect(self.refresh)
+        self.pkg_structure.toggled.connect(self._update_package_hint)
         self.refresh()
 
     # ------------------------------------------------------------ настройки
@@ -274,8 +260,6 @@ class SaveTempLayersDialog(QDialog):
     # ------------------------------------------------------------ режим
     def _apply_mode(self):
         package = self._mode == MODE_PACKAGE
-        self.pkg_archive.setEnabled(package)
-        self.pkg_structure.setEnabled(package)
         # при сборке слои всегда переключаются, а папка — data_all рядом с проектом
         self.replace.setVisible(not package)
         self.overwrite.setVisible(not package)
@@ -305,19 +289,21 @@ class SaveTempLayersDialog(QDialog):
             self.package_hint.setText("Проект ещё не сохранён — сначала будет предложено сохранить его: "
                                       "папка data_all появится рядом с файлом проекта.")
             return
-        if self.pkg_structure.isChecked():
-            text = ("Файлы слоёв скопируются в «{}» как есть, по тем же подпапкам, что и исходные; "
-                    "проект переключится на них и сохранится.").format(packager.data_dir(self.project))
-        else:
-            text = "Слои скопируются в «{}», проект переключится на них и сохранится.".format(
-                packager.data_dir(self.project))
+        text = ("Файлы слоёв скопируются в «{}» как есть" if self._native() else
+                "Слои скопируются в «{}» в выбранном формате").format(packager.data_dir(self.project))
+        text += (", по тем же подпапкам, что и исходные" if self.pkg_structure.isChecked()
+                 else ", все в одну папку")
+        text += "; проект переключится на них и сохранится."
         if self.pkg_archive.isChecked():
             text += " Рядом с проектом появится архив «{}.zip».".format(packager.archive_name(self.project))
         self.package_hint.setText(text)
 
+    def _native(self):
+        return bool(saver.FORMATS_BY_KEY[self.format.currentData()].get("native"))
+
     def _find(self):
         if self._mode == MODE_PACKAGE:
-            return packager.find_layers(self.project, self.pkg_structure.isChecked())
+            return packager.find_layers(self.project, self._native())
         return saver.find_layers(self.project, temporary_only=True)
 
     def busy(self):
@@ -377,6 +363,7 @@ class SaveTempLayersDialog(QDialog):
         single = saver.FORMATS_BY_KEY[self.format.currentData()]["single"] and self._mode != MODE_PACKAGE
         self.gpkg_name.setVisible(single)
         self.gpkg_name_label.setVisible(single)
+        self._update_package_hint()
 
     # ------------------------------------------------------------ сохранение
     def _selected(self):
@@ -472,20 +459,26 @@ class SaveTempLayersDialog(QDialog):
         if crs.isValid():
             text += "\n\nСистема координат слоёв и проекта: {}.".format(crs.authid() or crs.description())
         structure = self.pkg_structure.isChecked()
+        if self._native():
+            text += ("\n\nФайлы слоёв копируются как есть, в своих форматах и со всеми "
+                     "сопутствующими файлами. Слои в памяти и из баз, а также слои со сменой "
+                     "системы координат сохраняются в GeoPackage.")
         if structure:
-            text += ("\n\nФайлы копируются как есть, по тем же подпапкам: data/… → data_all/…, "
+            text += ("\n\nПодпапки — как у исходных файлов: data/… → data_all/…, "
                      "другие папки проекта — с тем же путём, файлы вне папки проекта — в "
                      "data_all/external_links/.")
             if copier.SPLIT_BY_TYPE:
                 text += (" Растры, облака точек и сетки — так же, но в data_all/raster/, "
                          "data_all/pointcloud/ и data_all/mesh/.")
-            text += " Слои в памяти и из баз — в выбранном формате в саму data_all."
+            text += " Слои в памяти и из баз — в саму data_all."
             flat = packager.flat_in_data_dir(self.project, items)
             if flat:
                 text += ("\n\nСлоёв, уже собранных в data_all без подпапок: {} — они останутся там же. "
                          "Их исходные папки проекту больше не известны, поэтому разложить их "
                          "по подпапкам нельзя. Нужна раскладка — соберите версию проекта, "
                          "сохранённую до прошлой сборки.").format(len(flat))
+        else:
+            text += "\n\nВсе файлы лягут прямо в data_all, без подпапок."
         if self.pkg_archive.isChecked():
             text += "\n\nЗатем рядом с проектом будет собран архив «{}.zip».".format(
                 packager.archive_name(self.project))
@@ -596,8 +589,6 @@ class SaveTempLayersDialog(QDialog):
                 self.btn_none, self.btn_refresh, self.replace, self.styles,
                 self.overwrite, self.btn_save):
             w.setEnabled(enabled)
-        self.pkg_archive.setEnabled(enabled and self._mode == MODE_PACKAGE)
-        self.pkg_structure.setEnabled(enabled and self._mode == MODE_PACKAGE)
         self.btn_close.setText("Закрыть" if enabled else "Отмена")
         if enabled:
             self._update_count()

@@ -287,10 +287,12 @@ def _key(path):
 
 
 def copy_layers(project, items, data_dir, project_dir, progress=None, is_cancelled=None,
-                home=None, max_depth=MAX_EXTERNAL_DEPTH, split_by_type=SPLIT_BY_TYPE):
-    """Копирует файлы слоёв items = [(layer, kind, temporary)] в data_dir по
-    правилам раскладки и переключает на них слои. Слои без Source сюда не
-    передаются. split_by_type — растры, облака точек и сетки в свои папки
+                home=None, max_depth=MAX_EXTERNAL_DEPTH, split_by_type=SPLIT_BY_TYPE,
+                structure=True):
+    """Копирует файлы слоёв items = [(layer, kind, temporary)] в data_dir и
+    переключает на них слои. Слои без Source сюда не передаются. structure —
+    раскладывать по подпапкам исходных файлов; без неё всё ложится прямо в
+    data_dir. split_by_type — растры, облака точек и сетки в свои папки
     (raster/, pointcloud/, mesh/). Возвращает результаты в формате saver.save_layers."""
     real_data = os.path.realpath(data_dir)
     sources, types = {}, {}  # {id слоя: Source}, {исходный файл/папка: типы данных его слоёв}
@@ -317,7 +319,8 @@ def copy_layers(project, items, data_dir, project_dir, progress=None, is_cancell
             if key not in copies:
                 copies[key] = _copy_unit(src.path, types[key], data_dir, real_data, project_dir, taken,
                                          home, max_depth,
-                                         unit_type(types[key], src.path) if split_by_type else "")
+                                         unit_type(types[key], src.path) if split_by_type else "",
+                                         structure)
             dest, note = copies[key]
             uri = src.uri(dest)
             old, crs = layer.source(), layer.crs()
@@ -339,20 +342,30 @@ def copy_layers(project, items, data_dir, project_dir, progress=None, is_cancell
     return results
 
 
-def _copy_unit(path, types, data_dir, real_data, project_dir, taken, home, max_depth, kind):
-    """Копирует файл со спутниками или папку целиком в подпапку по правилам
-    раскладки (kind — папка типа данных или пустая строка); возвращает (путь
-    копии, замечание). types — типы данных слоёв, читающих файл."""
-    is_dir = os.path.isdir(path)
-    if is_dir and saver.relative_inside(real_data, path) is not None:
+def _copy_unit(path, types, data_dir, real_data, project_dir, taken, home, max_depth, kind,
+               structure=True):
+    """Копирует файл или папку в подпапку по правилам раскладки (kind — папка
+    типа данных или пустая строка; structure — раскладывать по подпапкам);
+    возвращает (путь копии, замечание)."""
+    if os.path.isdir(path) and saver.relative_inside(real_data, path) is not None:
         raise RuntimeError("папка-источник содержит саму data_all — скопировать её нельзя")
     sub = target_subdir(os.path.dirname(os.path.normpath(path)), project_dir, data_dir, home, max_depth,
-                        kind=kind)
+                        kind=kind) if structure else ""
     dest_dir = os.path.join(data_dir, *sub.split("/")) if sub else data_dir
+    return copy_into(path, dest_dir, taken, types)
+
+
+def copy_into(path, dest_dir, taken, types=(), stem=None):
+    """Копирует файл со спутниками (или папку целиком) в dest_dir под свободным
+    именем; stem — новое имя без расширения вместо исходного. types — типы
+    данных слоёв, читающих файл (от них зависят сопутствующие файлы).
+    taken — {папка: занятые в этом запуске имена}. Возвращает (путь копии, замечание)."""
+    is_dir = os.path.isdir(path)
     main = os.path.basename(os.path.normpath(path))
     names = [] if is_dir else companion_names(path, "raster" in types, "pointcloud" in types)
     busy = taken.setdefault(os.path.normcase(os.path.abspath(dest_dir)), set())
-    stem, ext = (main, "") if is_dir else os.path.splitext(main)
+    old_stem, ext = (main, "") if is_dir else os.path.splitext(main)
+    stem = stem or old_stem
 
     def is_taken(candidate):
         new_main = candidate + ext
@@ -363,6 +376,7 @@ def _copy_unit(path, types, data_dir, real_data, project_dir, taken, home, max_d
 
     new_main = saver._unique(stem, is_taken) + ext
     busy.add(new_main.lower())
+    busy.add(os.path.splitext(new_main)[0].lower())  # сохранение слоёв занимает имена без расширения
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, new_main)
     if is_dir:
@@ -371,5 +385,6 @@ def _copy_unit(path, types, data_dir, real_data, project_dir, taken, home, max_d
         for name in names:
             shutil.copy2(os.path.join(os.path.dirname(path), name),
                          os.path.join(dest_dir, _renamed(name, main, new_main)))
-    note = "имя «{}» уже занято — скопирован как «{}»".format(main, new_main) if new_main != main else ""
+    note = ("имя «{}» уже занято — скопирован как «{}»".format(stem + ext, new_main)
+            if new_main != stem + ext else "")
     return dest, note

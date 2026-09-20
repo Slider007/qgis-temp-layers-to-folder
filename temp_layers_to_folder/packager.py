@@ -410,11 +410,11 @@ def in_data_dir(layer, target):
     return saver._inside(source_path(layer), os.path.realpath(target))
 
 
-def find_layers(project, keep_structure=False):
-    """Слои для сборки — как saver.find_layers(temporary_only=False). Со
-    структурой папок в список попадают и облака точек с сетками: их файлы
-    копируются как есть; те, что так не скопировать, — в skipped с причиной."""
-    items, skipped = saver.find_layers(project, temporary_only=False, copy_as_is=keep_structure)
+def find_layers(project, native_format=False):
+    """Слои для сборки — как saver.find_layers(temporary_only=False). С форматом
+    «оставить родные форматы файлов» в список попадают и облака точек с сетками:
+    их файлы копируются как есть; те, что так не скопировать, — в skipped с причиной."""
+    items, skipped = saver.find_layers(project, temporary_only=False, copy_as_is=native_format)
     ready = []
     for item in items:
         reason = copier.copy_obstacle(item[0]) if item[1] in copier.AS_IS_ONLY else ""
@@ -464,12 +464,14 @@ def consolidate_project(project, items, fmt_key, crs=None, save_styles=True, inc
     """Собирает проект в data_all и, если make_archive, делает архив. items —
     выбранные слои [(layer, kind, temporary)]. save_project — как сохранить
     проект (в QGIS — через стандартное действие «Сохранить»), по умолчанию
-    project.write(). keep_structure — копировать файлы слоёв как есть по правилам
-    раскладки copier (data/… → data_all/…, файлы вне проекта — в
-    data_all/external_links/…), картинки — в data_all/symbols; без него слои
-    переводятся в формат fmt_key и ложатся в одну папку, картинки — в data_all/images.
-    split_by_type (по умолчанию copier.SPLIT_BY_TYPE) — со структурой папок
-    растры, облака точек и сетки ложатся в data_all/raster/, pointcloud/, mesh/.
+    project.write(). Формат «оставить родные форматы файлов» (fmt_key «native»)
+    копирует файлы слоёв как есть; остальные форматы переводят слои в них.
+    keep_structure — раскладывать по подпапкам исходных файлов (data/… →
+    data_all/…, файлы вне проекта — в data_all/external_links/…), картинки — в
+    data_all/symbols; без него всё ложится прямо в data_all, картинки — в
+    data_all/images. split_by_type (по умолчанию copier.SPLIT_BY_TYPE) — со
+    структурой папок растры, облака точек и сетки ложатся в data_all/raster/,
+    pointcloud/, mesh/.
 
     Возвращает словарь с итогами.
     """
@@ -489,25 +491,25 @@ def consolidate_project(project, items, fmt_key, crs=None, save_styles=True, inc
 
     # 1. слои → data_all, проект переключается на них
     split = copier.SPLIT_BY_TYPE if split_by_type is None else split_by_type
+    native = bool(saver.FORMATS_BY_KEY[fmt_key].get("native"))
     todo, already = [], []
     for item in items:
         layer, kind = item[0], item[1]
         # облака точек и сетки не перепроецируются: уже собранные остаются на месте
         reproject = _needs_crs(layer, use_crs) and kind not in copier.AS_IS_ONLY
         (todo if not in_data_dir(layer, target) or reproject else already).append(item)
-    # Со структурой папок файлы копируются как есть (copier). В выбранный формат
-    # переводятся слои без файла (в памяти, из баз, результаты Processing — в
-    # корень data_all или data_all/raster) и файлы, которые как есть не
-    # скопировать (VRT, смена СК), — на своё место в структуре.
+    # С родными форматами файлы копируются как есть (copier), под своими именами.
+    # В формат fmt_key переводятся слои без файла (в памяти, из баз), результаты
+    # Processing и файлы, которые как есть не скопировать (VRT, смена СК).
     to_copy, subdirs, names = [], None, None
-    if keep_structure:
+    if native:
         to_copy = [it for it in todo if not it[2] and copier.layer_source(it[0]) is not None
                    and (it[1] in copier.AS_IS_ONLY or not _needs_crs(it[0], use_crs))]
     copy_ids = {it[0].id() for it in to_copy}
     rest = [it for it in todo if it[0].id() not in copy_ids]
     to_convert = [it for it in rest if it[1] not in copier.AS_IS_ONLY]
-    blocked = [_result(it[0], copier.copy_obstacle(it[0]) if keep_structure else
-                       "облака точек и сетки собираются только со структурой папок")
+    blocked = [_result(it[0], copier.copy_obstacle(it[0]) if native else
+                       "облака точек и сетки собираются только с родными форматами файлов")
                for it in rest if it[1] in copier.AS_IS_ONLY]
     if keep_structure:
         subdirs, names = {}, {}
@@ -530,7 +532,7 @@ def consolidate_project(project, items, fmt_key, crs=None, save_styles=True, inc
         copied = copier.copy_layers(
             project, to_copy, target, project_dir,
             progress=lambda i, total, n: step(len(already) + len(to_convert) + i, n),
-            is_cancelled=is_cancelled, split_by_type=split)
+            is_cancelled=is_cancelled, split_by_type=split, structure=keep_structure)
         for r in copied:
             if r["ok"] and r["id"] in kept_crs:
                 r["message"] = "; ".join(m for m in (r["message"], "система координат не изменена — "

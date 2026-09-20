@@ -65,6 +65,16 @@
   delimitedtext, spatialite, pdal, copc, ept, vpc, mdal (subset, layername,
   /vsizip/, `Ugrid:"…":mesh2d` сохраняются); у gdal для NetCDF/HDF в `path`
   лежит вся строка `NETCDF:"…":var` — файл вынимается regex.
+- Формат «native» и флажок структуры независимы (ТЗ пользователя от 2026-09-20):
+  формат решает, копировать файлы как есть (`copier.copy_layers` в сборке,
+  `saver._copy_native` для временных и слоёв без файла), флажок — подпапки
+  (`subdirs`/`structure`). Список слоёв зависит от формата: облака точек и
+  сетки появляются только с «native», поэтому `format.currentIndexChanged`
+  вызывает `refresh`.
+- Qt: у виджетов непоказанного окна `isVisible()` всегда False — в тестах
+  `isVisibleTo(окно)`; координаты — после `layout().activate()`.
+- macOS: QGIS пишет `.qml` в разложенной форме Юникода (NFD), а Python строки
+  в NFC — в тестах имена файлов сравниваются через `unicodedata.normalize`.
 - Разделение по типу (ТЗ пользователя, `copier.SPLIT_BY_TYPE`): папка типа
   решается на весь файл (`copier.unit_type`) по типам слоёв, которые его читают,
   плюс для растра — есть ли в контейнере вектор (`container_types`, GDAL

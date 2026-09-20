@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import traceback
+import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -903,7 +904,7 @@ def test_copy_structure():
     items, skipped = saver.find_layers(p, temporary_only=False)
     assert not skipped, skipped
     with _Home(home):
-        res = packager.consolidate_project(p, items, "gpkg", include_fonts=False, keep_structure=True)
+        res = packager.consolidate_project(p, items, "native", include_fonts=False, keep_structure=True)
     D = j(P, "data_all")
     by_name = {r["name"]: r for r in res["results"]}
     assert all(r["ok"] for r in res["results"]), [r for r in res["results"] if not r["ok"]]
@@ -974,7 +975,7 @@ def test_copy_structure():
 
     # повторная сборка: всё уже в data_all — ничего не копируется
     items, _ = saver.find_layers(p, temporary_only=False)
-    res2 = packager.consolidate_project(p, items, "gpkg", include_fonts=False, make_archive=False,
+    res2 = packager.consolidate_project(p, items, "native", include_fonts=False, make_archive=False,
                                         keep_structure=True)
     assert res2["results"] == [] and len(res2["already"]) == len(items), res2["results"]
 
@@ -989,7 +990,7 @@ def test_copy_structure_crs():
     assert p.write(os.path.join(P, "Проект.qgz"))
     with _Home(home):
         res = packager.consolidate_project(p, [(L["les"], "vector", False), (L["top"], "vector", False)],
-                                           "gpkg", crs=UTM37, include_fonts=False, make_archive=False,
+                                           "native", crs=UTM37, include_fonts=False, make_archive=False,
                                            keep_structure=True)
     assert all(r["ok"] for r in res["results"]), res["results"]
     D = os.path.join(P, "data_all")
@@ -1018,7 +1019,7 @@ def test_copy_structure_crs_container_names():
             p, [(L["ga"], "vector", False), (L["gb"], "vector", False), (ka, "vector", False),
                 (kb, "vector", False), (L["les"], "vector", False), (L["dir"], "vector", False),
                 (L["nc"], "raster", False)],
-            "gpkg", crs=UTM37, include_fonts=False, make_archive=False, keep_structure=True)
+            "native", crs=UTM37, include_fonts=False, make_archive=False, keep_structure=True)
     assert all(r["ok"] for r in res["results"]), res["results"]
     D = os.path.join(P, "data_all")
 
@@ -1148,11 +1149,11 @@ def test_split_by_type():
     root = os.path.join(OUT, "split")
     p, P, home, L = split_project(root)
 
-    items, skipped = packager.find_layers(p, keep_structure=False)
+    items, skipped = packager.find_layers(p, native_format=False)
     reasons = {l.name(): r for l, r in skipped}
-    assert reasons["Облако"] == "облако точек — только со структурой папок", reasons
+    assert reasons["Облако"] == "облако точек — только с родными форматами", reasons
     assert "Сетка" in reasons and "Сетка с расчётом" in reasons, reasons
-    items, skipped = packager.find_layers(p, keep_structure=True)
+    items, skipped = packager.find_layers(p, native_format=True)
     kinds = {l.name(): k for l, k, _t in items}
     assert kinds["Облако"] == "pointcloud" and kinds["Сетка"] == "mesh", kinds
     assert saver.describe(L["cloud"], "pointcloud", False) == "облако точек .las"
@@ -1162,7 +1163,7 @@ def test_split_by_type():
     assert "дополнительные наборы данных" in reasons["Сетка с расчётом"]
 
     with _Home(home):
-        res = packager.consolidate_project(p, items + [(L["mesh2"], "mesh", False)], "gpkg",
+        res = packager.consolidate_project(p, items + [(L["mesh2"], "mesh", False)], "native",
                                            include_fonts=False, keep_structure=True)
     by_name = {r["name"]: r for r in res["results"]}
     assert not by_name["Сетка с расчётом"]["ok"] and "наборы данных" in by_name["Сетка с расчётом"]["message"]
@@ -1226,6 +1227,133 @@ def zipfile_readme(path):
     return z.read(next(n for n in z.namelist() if n.endswith("/Состав.txt"))).decode("utf-8-sig")
 
 
+def test_native_format_package():
+    """«Оставить родные форматы файлов» и флажок подпапок независимы: без флажка
+    файлы копируются как есть прямо в data_all, с другим форматом слои
+    переводятся в него, но ложатся по исходным подпапкам."""
+    from temp_layers_to_folder import packager
+
+    j = os.path.join
+    # родные форматы без подпапок — всё как есть, в одну папку
+    root = os.path.join(OUT, "native_flat")
+    p, P, home, L = copy_project(root)
+    assert p.write(j(P, "Проект.qgz"))
+    items, _ = packager.find_layers(p, native_format=True)
+    with _Home(home):
+        res = packager.consolidate_project(p, items, "native", include_fonts=False, make_archive=False,
+                                           keep_structure=False)
+    assert all(r["ok"] for r in res["results"]), [r for r in res["results"] if not r["ok"]]
+    D = j(P, "data_all")
+    names = sorted(n for n in os.listdir(D) if not n.endswith(("-wal", "-shm")))
+    assert "лес.shp" in names and "лес.dbf" in names and "граница.geojson" in names, names
+    assert "участки.gpkg" in names and "dem.tif" in names and "dem.tfw" in names, names
+    assert [n for n in names if os.path.isdir(j(D, n))] == ["images", "папка_shp"], names
+    assert L["les"].source() == j(D, "лес.shp")
+    assert L["ga"].source() == j(D, "участки.gpkg") + "|layername=a"
+    assert L["mem"].source().startswith(j(D, "Черновик.gpkg"))  # в памяти — в GeoPackage
+    assert L["dup1"].source() == j(D, "реки.geojson") and L["dup2"].source() == j(D, "реки_2.geojson")
+
+    # другой формат со структурой папок — слои переводятся в формат, но по подпапкам
+    root = os.path.join(OUT, "convert_struct")
+    p, P, home, L = copy_project(root)
+    assert p.write(j(P, "Проект.qgz"))
+    items, _ = packager.find_layers(p, native_format=False)
+    with _Home(home):
+        res = packager.consolidate_project(p, items, "gpkg", include_fonts=False, make_archive=False,
+                                           keep_structure=True)
+    assert all(r["ok"] for r in res["results"]), [r for r in res["results"] if not r["ok"]]
+    D = j(P, "data_all")
+    assert L["les"].source().startswith(j(D, "ЛЕС", "лес.gpkg")), L["les"].source()
+    assert L["ga"].source().startswith(j(D, "ЛЕС", "2024", "Участки А.gpkg")), L["ga"].source()
+    # имя файла — как у исходного: структура повторяет исходную раскладку
+    assert L["csv"].source().startswith(j(D, "Рабочие файлы", "точки.gpkg")), L["csv"].source()
+    assert L["trees"].source().startswith(
+        j(D, "external_links", "Desktop", "ЛЭП", "узел7", "trees.gpkg")), L["trees"].source()
+    assert L["mem"].source().startswith(j(D, "Черновик.gpkg")), L["mem"].source()  # без файла — в data_all
+    # растр без смены СК копируется как есть, но в raster/ по структуре
+    assert L["dem"].source() == j(D, "raster", "Рельеф", "dem.tif"), L["dem"].source()
+
+
+def test_native_format_temp_mode():
+    """В режиме временных слоёв «родные форматы» копируют файлы результатов
+    Processing как есть, под названием слоя; слои в памяти — в GeoPackage."""
+    j = os.path.join
+    p = QgsProject.instance()
+    p.clear()
+    tmp = j(QgsProcessingUtils.tempFolder(), "tests_native")
+    shutil.rmtree(tmp, ignore_errors=True)
+    shp = _vector_file(j(tmp, "OUTPUT.shp"), "ESRI Shapefile")
+    mem = QgsVectorLayer("Point?crs=EPSG:4326", "Черновик", "memory")
+    out_shp = QgsVectorLayer(shp, "Буферизованный", "ogr")
+    ras = QgsRasterLayer(_tif(j(tmp, "OUTPUT.tif")), "Уклон", "gdal")
+    p.addMapLayers([mem, out_shp, ras])
+    items = saver.find_temporary_layers(p)
+    assert sorted(l.name() for l, *_ in items) == ["Буферизованный", "Уклон", "Черновик"], items
+
+    out = os.path.join(OUT, "native_temp")
+    res = saver.save_layers(p, items, out, "native")
+    assert all(r["ok"] for r in res), res
+    # macOS: QGIS пишет .qml в другой форме записи Юникода — сравниваем нормализованные имена
+    names = sorted(unicodedata.normalize("NFC", n) for n in os.listdir(out))
+    assert "Буферизованный.shp" in names and "Буферизованный.dbf" in names, names
+    assert "Черновик.gpkg" in names and "Уклон.tif" in names, names
+    assert out_shp.source() == j(out, "Буферизованный.shp") and out_shp.featureCount() == 2
+    assert mem.source().startswith(j(out, "Черновик.gpkg"))
+    assert "Буферизованный.qml" in names  # стиль рядом с копией
+
+    # СК, назначенная слою (в файле её нет), сохраняется; файл с двумя слоями копируется один раз
+    os.remove(j(tmp, "OUTPUT.prj"))
+    no_crs = QgsVectorLayer(shp, "Без СК", "ogr")
+    no_crs.setCrs(UTM37)
+    gpkg = _vector_file(j(tmp, "ДВА.gpkg"), "GPKG", "a")
+    _vector_file(gpkg, "GPKG", "b", n=3, append=True)
+    two = [QgsVectorLayer(gpkg + "|layername=" + n, "Таблица " + n, "ogr") for n in ("a", "b")]
+    p.addMapLayers([no_crs] + two)
+    out2 = os.path.join(OUT, "native_temp2")
+    res = saver.save_layers(p, [(l, "vector", True) for l in [no_crs] + two], out2, "native")
+    assert all(r["ok"] for r in res), res
+    assert no_crs.crs() == UTM37, no_crs.crs()
+    copy = j(out2, "Таблица a.gpkg")
+    assert two[0].source() == copy + "|layername=a" and two[1].source() == copy + "|layername=b", two[1].source()
+    assert two[1].featureCount() == 3
+    assert [n for n in os.listdir(out2) if n.endswith(".gpkg")] == ["Таблица a.gpkg"], os.listdir(out2)
+
+    # источник-папка копируется целиком, файла стиля рядом с папкой не появляется
+    folder = j(tmp, "папка_shp")
+    _vector_file(j(folder, "x.shp"), "ESRI Shapefile")
+    _vector_file(j(folder, "y.shp"), "ESRI Shapefile")
+    from_dir = QgsVectorLayer(folder + "|layername=y", "Из папки", "ogr")
+    p.addMapLayer(from_dir)
+    out3 = os.path.join(OUT, "native_temp3")
+    res = saver.save_layers(p, [(from_dir, "vector", True)], out3, "native")
+    assert res[0]["ok"], res
+    assert from_dir.source() == j(out3, "Из папки") + "|layername=y", from_dir.source()
+    assert sorted(os.listdir(out3)) == ["Из папки"], os.listdir(out3)
+    assert sorted(os.listdir(j(out3, "Из папки"))) == sorted(os.listdir(folder))
+
+
+def test_native_format_keeps_edits():
+    """С родными форматами слой с незавершённой правкой не копируется, а
+    записывается: иначе правка не попала бы в копию."""
+    j = os.path.join
+    p = QgsProject.instance()
+    p.clear()
+    path = _vector_file(j(OUT, "edits", "исходный.geojson"), "GeoJSON")
+    lay = QgsVectorLayer(path, "Правки", "ogr")
+    p.addMapLayer(lay)
+    lay.startEditing()
+    f = QgsFeature(lay.fields())
+    f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(39.5, 48.9)))
+    lay.addFeature(f)
+    out = j(OUT, "edits_out")
+    res = saver.save_layers(p, [(lay, "vector", False)], out, "native", replace=False)
+    assert res[0]["ok"] and res[0]["path"].endswith(".gpkg"), res  # записан, а не скопирован
+    assert "несохранённые правки попали в копию" in res[0]["message"], res
+    copy = QgsVectorLayer(res[0]["uri"], "копия", "ogr")
+    assert copy.isValid() and copy.featureCount() == 3, copy.featureCount()
+    lay.rollBack()
+
+
 def test_pointcloud_sources():
     """Адреса облаков точек: EPT копируется папкой (ept.json внутри), у COPC
     меняется путь при новом имени, виртуальное облако (.vpc) не копируется.
@@ -1275,7 +1403,7 @@ def test_split_by_type_crs_and_off():
     items = [(L["dem"], "raster", False), (L["cloud"], "pointcloud", False)]
     with _Home(home):
         res = packager.consolidate_project(p, items + [(L["t1"], "raster", False), (L["t2"], "raster", False)],
-                                           "gpkg", crs=MSK, include_fonts=False, make_archive=False,
+                                           "native", crs=MSK, include_fonts=False, make_archive=False,
                                            keep_structure=True)
     assert all(r["ok"] for r in res["results"]), res["results"]
     D = j(P, "data_all")
@@ -1287,20 +1415,20 @@ def test_split_by_type_crs_and_off():
     assert L["cloud"].source() == j(D, "pointcloud", "Облака", "cloud.las")
     assert "система координат не изменена" in res["results"][1]["message"], res["results"]
     # повторно: облако уже в data_all — не копируется второй раз, хотя его СК другая
-    res = packager.consolidate_project(p, items, "gpkg", crs=MSK, include_fonts=False,
+    res = packager.consolidate_project(p, items, "native", crs=MSK, include_fonts=False,
                                        make_archive=False, keep_structure=True)
     assert res["results"] == [] and len(res["already"]) == 2, res
     assert sorted(os.listdir(j(D, "pointcloud", "Облака"))) == ["cloud.copc.laz", "cloud.las"]
     # без структуры папок сетка не собирается
     res = packager.consolidate_project(p, [(L["mesh"], "mesh", False)], "gpkg", include_fonts=False,
                                        make_archive=False)
-    assert not res["results"][0]["ok"] and "только со структурой" in res["results"][0]["message"], res
+    assert not res["results"][0]["ok"] and "родными форматами" in res["results"][0]["message"], res
 
     root = os.path.join(OUT, "split_off")
     p, P, home, L = split_project(root)
-    items, _ = packager.find_layers(p, keep_structure=True)
+    items, _ = packager.find_layers(p, native_format=True)
     with _Home(home):
-        res = packager.consolidate_project(p, items, "gpkg", include_fonts=False, make_archive=False,
+        res = packager.consolidate_project(p, items, "native", include_fonts=False, make_archive=False,
                                            keep_structure=True, split_by_type=False)
     assert all(r["ok"] for r in res["results"]), res["results"]
     D = j(P, "data_all")
@@ -1313,10 +1441,11 @@ def test_split_by_type_crs_and_off():
     assert L["tmp"].source() == j(D, "Уклон.tif"), L["tmp"].source()
 
 
-def test_split_dialog_list():
-    """Облака точек и сетки становятся доступны в списке, когда включают
-    «Сохранять структуру папок»; снятые галочки у других слоёв не сбрасываются."""
-    from qgis.PyQt.QtCore import Qt
+def test_split_dialog_list():  # noqa: C901
+    """Облака точек и сетки становятся доступны в списке, когда в «Формате»
+    выбирают «Оставить родные форматы файлов»; снятые галочки у других слоёв
+    не сбрасываются. Флажки сборки — внизу, вместе с остальными."""
+    from qgis.PyQt.QtCore import QPoint, Qt
     from qgis.PyQt.QtWidgets import QMainWindow
 
     from temp_layers_to_folder import dialog as dlg_mod
@@ -1331,24 +1460,36 @@ def test_split_dialog_list():
     iface = Iface()
     d = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
     d.mode_package.setChecked(True)
-    d.pkg_structure.setChecked(False)
+    d.format.setCurrentIndex(d.format.findData("gpkg"))
 
     def row(name):
         return next(d.layers.item(i) for i in range(d.layers.count())
                     if d.layers.item(i).text().startswith(name + "   "))
 
     assert not row("Облако").flags() & Qt.ItemFlag.ItemIsUserCheckable
-    assert "только со структурой папок" in row("Облако").text()
+    assert "только с родными форматами" in row("Облако").text()
     row("Дороги").setCheckState(dlg_mod.UNCHECKED)
-    d.pkg_structure.setChecked(True)
+    d.format.setCurrentIndex(d.format.findData("native"))
     assert row("Облако").checkState() == dlg_mod.CHECKED and "облако точек .las" in row("Облако").text()
     assert row("Сетка").checkState() == dlg_mod.CHECKED
     assert not row("Сетка с расчётом").flags() & Qt.ItemFlag.ItemIsUserCheckable
     assert row("Дороги").checkState() == dlg_mod.UNCHECKED
     assert {l.name() for l, *_ in d._selected()} >= {"Облако", "Сетка"}
     assert "data_all/pointcloud" in d.pkg_structure.toolTip()
-    d.pkg_structure.setChecked(False)
+    assert "как есть" in d.format.toolTip()
+    # флажки сборки — внизу, ниже списка слоёв, вместе с «Сохранить стили слоёв»
+    d.layout().activate()
+
+    def top(w):
+        return w.mapTo(d, QPoint(0, 0)).y()
+
+    assert top(d.pkg_structure) > top(d.layers) and top(d.pkg_archive) > top(d.layers)
+    assert abs(top(d.pkg_structure) - top(d.styles)) < 100, (top(d.pkg_structure), top(d.styles))
+    assert d.pkg_structure.isVisibleTo(d) and d.pkg_archive.isVisibleTo(d)
+    # в режиме временных слоёв флажков сборки нет
+    d.format.setCurrentIndex(d.format.findData("gpkg"))
     d.mode_temp.setChecked(True)
+    assert not d.pkg_structure.isVisibleTo(d) and not d.pkg_archive.isVisibleTo(d)
     d._save_settings()
     d.close()
 
@@ -1356,7 +1497,7 @@ def test_split_dialog_list():
 def test_keep_structure_dialog():
     """Флажок «Сохранять структуру папок» — только у сборки. Проект, уже собранный
     без подпапок, раскладке не поддаётся — окно предупреждает об этом до сборки.
-    Исходная версия проекта раскладывается; выбор запоминается."""
+    Исходная версия проекта раскладывается; выбор формата и флажка запоминается."""
     from qgis.PyQt.QtWidgets import QMainWindow, QMessageBox
 
     from temp_layers_to_folder import dialog as dlg_mod
@@ -1392,17 +1533,19 @@ def test_keep_structure_dialog():
     iface = Iface()
     d = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
     d.mode_temp.setChecked(True)
-    assert not d.pkg_structure.isEnabled()
+    assert not d.pkg_structure.isVisibleTo(d)
     d.mode_package.setChecked(True)
-    assert d.pkg_structure.isEnabled() and not d.pkg_structure.isChecked()
+    assert d.pkg_structure.isVisibleTo(d) and not d.pkg_structure.isChecked()
     d.pkg_archive.setChecked(False)
     d.pkg_fonts.setChecked(False)
     d.crs.setCrs(QgsCoordinateReferenceSystem())
 
     # сборка без подпапок, как в прошлых версиях, затем повторная — с флажком
     d.run()
-    assert os.path.isfile(j(data, "Опоры.gpkg")) and "подпапк" not in asked[-1], d.log.toPlainText()
+    assert os.path.isfile(j(data, "Опоры.gpkg")), d.log.toPlainText()
+    assert "прямо в data_all, без подпапок" in asked[-1], asked[-1]
     d.pkg_structure.setChecked(True)
+    d.format.setCurrentIndex(d.format.findData("native"))
     assert "по тем же подпапкам" in d.package_hint.text(), d.package_hint.text()
     d.run()
     assert "без подпапок: 6" in asked[-1], asked[-1]
@@ -1414,9 +1557,10 @@ def test_keep_structure_dialog():
     assert p.write(proj)
     d2 = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
     assert d2.mode_package.isChecked() and d2.pkg_structure.isChecked()
+    assert d2.format.currentData() == "native"
     with _Home(root):
         d2.run()
-    assert "по тем же подпапкам" in asked[-1] and "без подпапок" not in asked[-1], asked[-1]
+    assert "Подпапки — как у исходных" in asked[-1] and "без подпапок" not in asked[-1], asked[-1]
     log = d2.log.toPlainText().replace(os.sep, "/")
     for rel in ("Данные/Вектор/Опоры.geojson", "raster/Данные/Растры/dem.tif", "Карта.geojson",
                 "external_links/Архив/Топо/a.geojson", "external_links/Архив/Почвы/b.geojson",
@@ -1424,6 +1568,7 @@ def test_keep_structure_dialog():
         assert os.path.isfile(j(data, rel)) and "data_all/" + rel in log, (rel, log)
     assert "Свои картинки: 2 шт. в data_all/symbols/" in log, log
     d2.pkg_structure.setChecked(False)
+    d2.format.setCurrentIndex(d2.format.findData("gpkg"))
     d2.pkg_archive.setChecked(True)
     d2.mode_temp.setChecked(True)
     d2._save_settings()
@@ -1689,11 +1834,13 @@ def test_dialog():
     assert sorted(d._radios) == [dlg_mod.MODE_PACKAGE, dlg_mod.MODE_TEMP] and not hasattr(d, "mode_all")
     assert not hasattr(d, "structure") and d.pkg_structure.text() == "Сохранять структуру папок"
     d.mode_package.setChecked(True)
-    assert d.layers_box.title() == "Слои проекта" and d.pkg_archive.isEnabled() and d.pkg_structure.isEnabled()
+    assert d.layers_box.title() == "Слои проекта"
+    assert d.pkg_archive.isVisibleTo(d) and d.pkg_structure.isVisibleTo(d)
     assert [it.text().split("   ")[0] for it in d._items()][-1] == "Постоянный"
     assert len(list(d._items())) == 6
     d.mode_temp.setChecked(True)
-    assert d.replace.isChecked() and not d.pkg_archive.isEnabled() and not d.pkg_structure.isEnabled()
+    assert d.replace.isChecked()
+    assert not d.pkg_archive.isVisibleTo(d) and not d.pkg_structure.isVisibleTo(d)
     items = list(d._items())
     assert len(items) == 5
     items[0].setCheckState(dlg_mod.UNCHECKED)

@@ -50,6 +50,9 @@ FORMATS = [  # первый — формат по умолчанию
      "driver": "ESRI Shapefile", "ext": "shp", "single": False},
     {"key": "geojson", "label": "GeoJSON",
      "driver": "GeoJSON", "ext": "geojson", "single": False},
+    # файлы копируются как есть; слои без файла (в памяти, из баз) — в GeoPackage
+    {"key": "native", "label": "Оставить родные форматы файлов",
+     "driver": "GPKG", "ext": "gpkg", "single": False, "native": True},
 ]
 FORMATS_BY_KEY = {f["key"]: f for f in FORMATS}
 
@@ -171,7 +174,7 @@ def classify(layer, processing_dir=None, copy_as_is=False):
         if missing_file(layer):
             return None, False, _FILE_GONE
         if not copy_as_is:
-            return None, False, "{} — только со структурой папок".format(label)
+            return None, False, "{} — только с родными форматами".format(label)
         return kind, False, ""
     return None, False, _UNSUPPORTED_TYPES.get(type(layer).__name__, "этот тип слоя не поддерживается")
 
@@ -476,6 +479,25 @@ def _repoint(layer, uri, provider, project, crs=None):
     return True
 
 
+def _copy_native(layer, dest, base, taken, copies):
+    """Копирует файл слоя как есть (формат «родные форматы файлов»): возвращает
+    (путь копии, адрес слоя, замечание) или None, если источник — не файл.
+    copies — уже скопированные в этом запуске файлы: контейнер копируется один раз."""
+    from . import copier  # импорт здесь: copier сам опирается на saver
+
+    src = copier.layer_source(layer)
+    if src is None:
+        return None
+    key = os.path.normcase(os.path.realpath(src.path))
+    note = ""
+    if key in copies:
+        path = copies[key]
+    else:
+        path, note = copier.copy_into(src.path, dest, taken, stem=base)
+        copies[key] = path
+    return path, src.uri(path), note
+
+
 def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 replace=True, save_styles=True, overwrite=False, crs=None,
                 progress=None, is_cancelled=None, own_fields_only=None, subdirs=None, names=None):
@@ -506,6 +528,7 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
 
     subdirs = subdirs or {}
     taken_by_dir = {}  # {папка: занятые в этом запуске имена (в нижнем регистре)}
+    native_copies = {}  # {исходный файл: копия} — контейнер копируется один раз
 
     def taken_in(dest):
         return taken_by_dir.setdefault(os.path.normcase(os.path.abspath(dest)), set())
@@ -557,7 +580,27 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
             ct = QgsCoordinateTransform(layer.crs(), target, tc) if target else None
             res["crs"] = target
 
-            if kind == "raster":
+            # «Оставить родные форматы файлов»: файл слоя копируется как есть.
+            # Слой в режиме правки и перепроецирование — только через запись.
+            native = None
+            if (fmt.get("native") and kind != "raster" and target is None
+                    and not (isinstance(layer, QgsVectorLayer) and layer.isEditable())):
+                os.makedirs(dest, exist_ok=True)
+                native = _copy_native(layer, dest, base, taken_by_dir, native_copies)
+
+            if native is not None:
+                path, uri, note = native
+                if note:
+                    notes.append(note)
+                if save_styles and os.path.isfile(path):
+                    layer.saveNamedStyle(os.path.splitext(path)[0] + ".qml")
+                res.update(uri=uri, provider=layer.providerType())
+                keep = layer.crs() if layer.crs().isValid() else None  # СК могла быть назначена вручную
+                if can_repoint and not _repoint(layer, uri, layer.providerType(), project, keep):
+                    raise RuntimeError("файл скопирован, но слой не удалось переключить на него")
+                res.update(ok=True, path=path)
+
+            elif kind == "raster":
                 os.makedirs(dest, exist_ok=True)
                 path, stem = _save_raster(layer, dest, base, overwrite, taken, protected, target)
                 taken.add(stem.lower())

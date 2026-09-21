@@ -422,6 +422,41 @@ def _lep_project():
     return p, folder, font_dir, fams, svg, src, gj, (mem, pts, extra, xyz)
 
 
+def test_layout_fonts():
+    """Шрифты легенды и сетки карты в макете. В QGIS 3.44 цепочка
+    legend.style(…).textFormat() роняла QGIS при сборке проекта с легендой:
+    style() отдаёт временный объект, и textFormat() ссылается на удалённое."""
+    from qgis.core import (QgsLayoutItemLegend, QgsLayoutItemMap, QgsLayoutItemMapGrid,
+                           QgsPrintLayout, QgsTextFormat)
+    from qgis.PyQt.QtGui import QFont
+
+    from temp_layers_to_folder import packager
+
+    p = QgsProject.instance()
+    p.clear()
+    p.addMapLayer(QgsVectorLayer("Point?crs=EPSG:4326", "точки", "memory"))
+    layout = QgsPrintLayout(p)
+    layout.initializeDefaults()
+    legend = QgsLayoutItemLegend(layout)
+    comp = packager._legend_component("Title")
+    style = legend.style(comp)
+    tf = style.textFormat()
+    tf.setFont(QFont("ЛегендаТест"))
+    style.setTextFormat(tf)
+    legend.setStyle(comp, style)
+    layout.addLayoutItem(legend)
+    lmap = QgsLayoutItemMap(layout)
+    layout.addLayoutItem(lmap)
+    grid = QgsLayoutItemMapGrid("сетка", lmap)
+    gtf = QgsTextFormat()
+    gtf.setFont(QFont("СеткаТест"))
+    grid.setAnnotationTextFormat(gtf)
+    lmap.grids().addGrid(grid)
+    p.layoutManager().addLayout(layout)
+    fams = packager.used_font_families(p)
+    assert {"ЛегендаТест", "СеткаТест"} <= fams, fams
+
+
 def test_font_license_kind():
     from temp_layers_to_folder.fonts import FREE, PAID, UNKNOWN, license_kind
 
@@ -1697,9 +1732,9 @@ def _mldata(path, records, version=2):
 def test_memory_layer_saver_not_loaded():
     """Временные слои модуля Memory Layer Saver: он хранит их объекты в проекте и
     загружает при открытии. Если модуль не установлен или выключен, слой пустой —
-    сохранить его значило бы заменить объекты пустым файлом (отзыв сотрудницы,
-    слой «Нац парк» в data_all оказался пустым). Такой слой не сохраняется и виден
-    с причиной; пустые по-настоящему и загруженные слои сохраняются как раньше."""
+    сохранить его значило бы заменить объекты пустым файлом. Такой слой не
+    сохраняется и виден с причиной; пустые по-настоящему и загруженные слои
+    сохраняются как раньше."""
     import zipfile
 
     from qgis.PyQt.QtCore import QDate, Qt

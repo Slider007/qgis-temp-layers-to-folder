@@ -261,7 +261,10 @@ def used_font_families(project, layer_ids=None):
             if isinstance(item, QgsLayoutItemLegend):
                 for name in ("Title", "Group", "Subgroup", "SymbolLabel"):
                     try:
-                        fams.add(_family(item.style(_legend_component(name)).textFormat()))
+                        # style() — временный объект: держим его, пока читаем шрифт,
+                        # иначе textFormat() ссылается на удалённое и QGIS 3.44 падает
+                        style = item.style(_legend_component(name))
+                        fams.add(_family(style.textFormat()))
                     except Exception:  # noqa: BLE001
                         pass
             if isinstance(item, QgsLayoutItemMap):  # сетки

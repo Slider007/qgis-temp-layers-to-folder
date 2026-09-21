@@ -332,7 +332,7 @@ class SaveTempLayersDialog(QDialog):
         for layer, reason in skipped:  # видно, но выбрать нельзя
             item = self._add_item(layer, reason, "{}   — {}")
             item.setFlags(Qt.ItemFlag.NoItemFlags)
-            item.setToolTip(reason)
+            item.setToolTip(saver.MLS_HINT if reason == saver.MLS_NOT_LOADED else reason)
         if self.layers.count() == 0:
             item = QListWidgetItem("В проекте нет временных слоёв" if self._mode == MODE_TEMP
                                    else "В проекте нет слоёв")

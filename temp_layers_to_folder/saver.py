@@ -179,20 +179,114 @@ def classify(layer, processing_dir=None, copy_as_is=False):
     return None, False, _UNSUPPORTED_TYPES.get(type(layer).__name__, "этот тип слоя не поддерживается")
 
 
+# ---------------------------------------------------------------- Memory Layer Saver
+
+# Модуль Memory Layer Saver хранит объекты временных слоёв в файле layers.mldata
+# внутри .qgz (раньше — в <проект>.mldata рядом) и загружает их при открытии
+# проекта. Если модуль не установлен или выключен, слои открываются пустыми:
+# сохранить такой слой — значит заменить его объекты пустым файлом.
+MLS_NOT_LOADED = "объекты не загружены — нужен Memory Layer Saver"
+MLS_HINT = ("Объекты этого временного слоя хранит модуль Memory Layer Saver, но при "
+            "открытии проекта он их не загрузил — слой пустой. Установите или включите "
+            "Memory Layer Saver и откройте проект заново.")
+_MLS_MAGIC = b"QGis.MemoryLayerData"
+
+
+def _mls_file(project):
+    """Файл данных Memory Layer Saver этого проекта или пустая строка."""
+    try:
+        attached = project.attachedFiles()
+    except Exception:  # noqa: BLE001
+        attached = []
+    for path in attached:
+        if path.endswith("layers.mldata"):
+            return path
+    legacy = project.fileName() + ".mldata" if project.fileName() else ""
+    return legacy if legacy and os.path.isfile(legacy) else ""
+
+
+_mls_cache = {}  # {(путь, время изменения, размер): id слоёв с объектами}
+
+
+def _mls_layers_with_features(path):
+    """Id слоёв, у которых в файле Memory Layer Saver есть объекты. Формат —
+    поток QDataStream (Qt 4.5): заголовок, версия 1 или 2 и слои подряд: id,
+    фильтр (с версии 2), поля, объекты. Непонятный файл — пустое множество.
+    Разбирается заново, только если файл изменился: список в окне обновляется часто."""
+    from qgis.PyQt.QtCore import QDataStream, QFile, QIODevice
+
+    try:
+        st = os.stat(path)
+    except OSError:
+        return set()
+    key = (path, st.st_mtime_ns, st.st_size)
+    if key in _mls_cache:
+        return _mls_cache[key]
+    found = set()
+    f = QFile(path)
+    if not f.open(QIODevice.OpenModeFlag.ReadOnly):
+        return found
+    try:
+        ds = QDataStream(f)
+        ds.setVersion(QDataStream.Version.Qt_4_5)
+        magic = bytes(ds.readUInt8() for _ in _MLS_MAGIC)
+        version = ds.readInt32()
+        while magic == _MLS_MAGIC and version in (1, 2) and not ds.atEnd() \
+                and ds.status() == QDataStream.Status.Ok:
+            layer_id = ds.readQString()
+            if version > 1:
+                ds.readQString()  # фильтр слоя
+            nattr = ds.readInt16()
+            for _ in range(nattr):  # имя, тип, имя типа, длина, точность, комментарий
+                ds.readQString(), ds.readInt16(), ds.readQString()
+                ds.readInt16(), ds.readInt16(), ds.readQString()
+            more = ds.readBool()
+            if more and ds.status() == QDataStream.Status.Ok:
+                found.add(layer_id)
+            while more and ds.status() == QDataStream.Status.Ok:
+                for _ in range(nattr):
+                    ds.readQVariant()
+                size = ds.readUInt32()
+                if size:
+                    ds.skipRawData(size)
+                more = ds.readBool()
+    except Exception:  # noqa: BLE001 — чужой формат: не разобрали, значит не знаем
+        found = set()
+    finally:
+        f.close()
+    _mls_cache.clear()
+    _mls_cache[key] = found
+    return found
+
+
+def mls_unloaded(project, layers):
+    """Id временных слоёв из layers, которые пусты, хотя Memory Layer Saver
+    хранит для них объекты: он их не загрузил."""
+    empty = {l.id() for l in layers
+             if isinstance(l, QgsVectorLayer) and l.providerType() == "memory" and l.featureCount() == 0}
+    path = _mls_file(project) if empty else ""
+    return empty & _mls_layers_with_features(path) if path else set()
+
+
 def find_layers(project, temporary_only=True, copy_as_is=False):
     """Слои проекта в порядке панели «Слои».
 
     Возвращает (items, skipped): items = [(layer, kind, temporary)] — что можно
-    сохранить; skipped = [(layer, причина)] — что сохранить нельзя (только для
-    режима «все слои»). copy_as_is — см. classify.
+    сохранить; skipped = [(layer, причина)] — что сохранить нельзя (для режима
+    «все слои»; временные слои, чьи объекты не загрузил Memory Layer Saver, —
+    в обоих режимах). copy_as_is — см. classify.
     """
     processing_dir = _processing_temp_dir()
     ordered = [n.layer() for n in project.layerTreeRoot().findLayers() if n.layer()]
     seen = {l.id() for l in ordered}
     ordered += [l for l in project.mapLayers().values() if l.id() not in seen]
+    unloaded = mls_unloaded(project, ordered)
 
     items, skipped = [], []
     for layer in ordered:
+        if layer.id() in unloaded:  # сохранили бы пустой файл вместо объектов
+            skipped.append((layer, MLS_NOT_LOADED))
+            continue
         kind, temporary, reason = classify(layer, processing_dir, copy_as_is)
         if temporary_only:
             if kind and temporary:

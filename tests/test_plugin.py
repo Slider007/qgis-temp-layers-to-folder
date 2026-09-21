@@ -883,7 +883,11 @@ def copy_project(root):
 
 
 def _label_svg(layer):
-    return layer.labeling().settings().format().background().svgFile()
+    # по шагам: цепочка временных объектов роняет Python в QGIS 3.44
+    labeling = layer.labeling()
+    settings = labeling.settings()
+    fmt = settings.format()
+    return fmt.background().svgFile()
 
 
 def test_copy_structure():
@@ -1652,6 +1656,144 @@ def test_deleted_source_file():
     res = packager.consolidate_project(p, items, "gpkg", include_fonts=False, make_archive=False)
     assert [r["name"] for r in res["results"]] == ["Живой"], res["results"]
     assert sorted(res["excluded"]) == ["Удалённый", "Удалённый растр"], res["excluded"]
+
+
+def _mldata(path, records, version=2):
+    """Файл данных Memory Layer Saver: records = [(id слоя, [(поле, тип QMetaType, имя
+    типа)], [([значения], wkt или None)])] — так, как его пишет сам модуль."""
+    from qgis.PyQt.QtCore import QDataStream, QFile, QIODevice
+
+    f = QFile(path)
+    assert f.open(QIODevice.OpenModeFlag.WriteOnly)
+    ds = QDataStream(f)
+    ds.setVersion(QDataStream.Version.Qt_4_5)
+    for c in b"QGis.MemoryLayerData":
+        ds.writeUInt8(c)
+    ds.writeUInt32(version)
+    for layer_id, fields, feats in records:
+        ds.writeQString(layer_id)
+        if version > 1:
+            ds.writeQString("")
+        ds.writeInt16(len(fields))
+        for name, qtype, typename in fields:
+            ds.writeQString(name)
+            ds.writeInt16(qtype)
+            ds.writeQString(typename)
+            ds.writeInt16(0)
+            ds.writeInt16(0)
+            ds.writeQString("")
+        for values, wkt in feats:
+            ds.writeBool(True)
+            for v in values:
+                ds.writeQVariant(v)
+            wkb = bytes(QgsGeometry.fromWkt(wkt).asWkb()) if wkt else b""
+            ds.writeUInt32(len(wkb))
+            if wkb:
+                ds.writeRawData(wkb)
+        ds.writeBool(False)
+    f.close()
+
+
+def test_memory_layer_saver_not_loaded():
+    """Временные слои модуля Memory Layer Saver: он хранит их объекты в проекте и
+    загружает при открытии. Если модуль не установлен или выключен, слой пустой —
+    сохранить его значило бы заменить объекты пустым файлом (отзыв сотрудницы,
+    слой «Нац парк» в data_all оказался пустым). Такой слой не сохраняется и виден
+    с причиной; пустые по-настоящему и загруженные слои сохраняются как раньше."""
+    import zipfile
+
+    from qgis.PyQt.QtCore import QDate, Qt
+    from qgis.PyQt.QtWidgets import QMainWindow
+
+    from temp_layers_to_folder import dialog as dlg_mod
+    from temp_layers_to_folder import packager
+
+    root = os.path.join(OUT, "mls")
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    p = QgsProject.instance()
+    p.clear()
+    park = QgsVectorLayer("Polygon?crs=EPSG:32637&field=name:string", "Нац парк", "memory")
+    draft = QgsVectorLayer("Point?crs=EPSG:32637", "Черновик", "memory")
+    new = QgsVectorLayer("LineString?crs=EPSG:32637", "Новый", "memory")
+    loaded = QgsVectorLayer("Point?crs=EPSG:32637&field=n:integer", "Загружен", "memory")
+    p.addMapLayers([park, draft, new, loaded])
+    fields = [("name", int(QMetaType.Type.QString), "string"), ("n", int(QMetaType.Type.Int), "integer"),
+              ("d", int(QMetaType.Type.QDate), "date"), ("x", int(QMetaType.Type.Double), "double")]
+    poly = "POLYGON((0 0,0 10,10 10,10 0,0 0))"
+    records = [
+        ("чужой_слой", fields, [(["длинная строка " * 20, 7, QDate(2026, 9, 21), 1.5], poly),
+                                ([None, None, None, None], None)]),
+        (park.id(), [fields[0]], [(["п%d" % i], poly) for i in range(3)]),
+        (draft.id(), [], []),  # пустой по-настоящему
+        (loaded.id(), [fields[1]], [([1], "POINT(1 1)"), ([2], "POINT(2 2)")]),
+    ]
+    _mldata(p.createAttachedFile("layers.mldata"), records)
+    qgz = os.path.join(root, "Проект.qgz")
+    assert p.write(qgz)
+    p.clear()
+    assert p.read(qgz)
+    loaded = p.mapLayersByName("Загружен")[0]  # его объекты модуль загрузил
+    for i in (1, 2):
+        f = QgsFeature(loaded.fields())
+        f.setAttributes([i])
+        f.setGeometry(QgsGeometry.fromWkt("POINT({0} {0})".format(i)))
+        loaded.dataProvider().addFeature(f)
+    park = p.mapLayersByName("Нац парк")[0]
+    assert park.featureCount() == 0
+
+    for items, skipped in (saver.find_layers(p, temporary_only=True), saver.find_layers(p, temporary_only=False),
+                           packager.find_layers(p), packager.find_layers(p, native_format=True)):
+        assert sorted(l.name() for l, *_ in items) == ["Загружен", "Новый", "Черновик"], items
+        assert [(l.name(), r) for l, r in skipped] == [("Нац парк", saver.MLS_NOT_LOADED)], skipped
+
+    # в окне — серой строкой с объяснением во всплывающей подсказке
+    class Iface:
+        w = QMainWindow()
+
+        def mainWindow(self):
+            return self.w
+
+        def messageBar(self):
+            return None
+
+        def layerTreeView(self):
+            return None
+
+    d = dlg_mod.SaveTempLayersDialog(Iface(), None)
+    for mode in (d.mode_temp, d.mode_package):
+        mode.setChecked(True)
+        d.refresh()
+        rows = [d.layers.item(i) for i in range(d.layers.count())]
+        grey = [r for r in rows if r.text().startswith("Нац парк")]
+        assert len(grey) == 1 and grey[0].flags() == Qt.ItemFlag.NoItemFlags, [r.text() for r in rows]
+        assert saver.MLS_NOT_LOADED in grey[0].text() and grey[0].toolTip() == saver.MLS_HINT
+    d.close()
+    d.deleteLater()
+
+    res = packager.consolidate_project(p, packager.find_layers(p)[0], "gpkg", include_fonts=False,
+                                       make_archive=False)
+    assert sorted(r["name"] for r in res["results"] if r["ok"]) == ["Загружен", "Новый", "Черновик"], res
+    assert park.providerType() == "memory" and res["excluded"] == ["Нац парк"], res["excluded"]
+    with zipfile.ZipFile(qgz) as z:  # данные Memory Layer Saver остались в проекте
+        assert any(n.endswith("layers.mldata") for n in z.namelist()), z.namelist()
+
+    # старый способ: <проект>.qgs.mldata рядом с проектом; формат версии 1 — без фильтра
+    p.clear()
+    old = QgsVectorLayer("Point?crs=EPSG:32637", "Старый", "memory")
+    p.addMapLayer(old)
+    qgs = os.path.join(root, "Старый.qgs")
+    assert p.write(qgs)
+    _mldata(qgs + ".mldata", [(old.id(), [], [([], "POINT(1 1)")])], version=1)
+    assert [(l.name(), r) for l, r in saver.find_layers(p)[1]] == [("Старый", saver.MLS_NOT_LOADED)]
+    with open(qgs + ".mldata", "r+b") as f:  # чужой заголовок — это не файл Memory Layer Saver
+        f.write(b"X")
+    assert [l.name() for l, *_ in saver.find_layers(p)[0]] == ["Старый"]
+    with open(qgs + ".mldata", "wb") as f:  # испорченный файл — не мешает сохранять
+        f.write(b"QGis.MemoryLayerData\x00\x00\x00\x02\xff\xff")
+    assert [l.name() for l, *_ in saver.find_layers(p)[0]] == ["Старый"]
+    os.remove(qgs + ".mldata")
+    assert [l.name() for l, *_ in saver.find_layers(p)[0]] == ["Старый"]
 
 
 def test_joins_relations_expressions():

@@ -520,19 +520,31 @@ def test_consolidate_project():
     assert 400000 < lmap.extent().center().x() < 600000, lmap.extent().toString()
     assert _p(mem.renderer().symbol().symbolLayer(0).path()) == _p(os.path.join(data, "images", "знак.svg"))
 
-    # «удаляем всё остальное» — проект продолжает работать
-    _move(src, src + "_удалено")
-    _move(os.path.dirname(svg), os.path.dirname(svg) + "_удалено")
+    # «удаляем всё остальное» — проект продолжает работать. В Windows папку, из которой
+    # читает неотмеченный слой, не перенести: проверяем копию проекта с одной data_all
+    windows = sys.platform.startswith("win")
+    if windows:
+        alone = os.path.join(OUT, "без исходников", os.path.basename(folder))
+        shutil.copytree(data, os.path.join(alone, "data_all"))
+        check = shutil.copy2(proj, alone)
+    else:
+        _move(src, src + "_удалено")
+        _move(os.path.dirname(svg), os.path.dirname(svg) + "_удалено")
+        check = proj
     p3 = QgsProject()
-    assert p3.read(proj)
+    assert p3.read(check)
     for layer in (mem, pts):
         l3 = p3.mapLayer(layer.id())
         assert l3.isValid() and l3.featureCount() > 0 and l3.crs() == UTM37, l3.source()
-    assert os.path.isfile(p3.mapLayer(mem.id()).renderer().symbol().symbolLayer(0).path())
+        assert not windows or _norm(l3.source().split("|")[0]).startswith(_norm(alone)), l3.source()
+    svg3 = p3.mapLayer(mem.id()).renderer().symbol().symbolLayer(0).path()
+    assert os.path.isfile(svg3) and (not windows or _norm(svg3).startswith(_norm(alone))), svg3
     pic3 = [i for i in p3.layoutManager().layoutByName("Лист 1").items() if isinstance(i, QgsLayoutItemPicture)][0]
     assert not pic3.isMissingImage()
-    _move(src + "_удалено", src)
-    _move(os.path.dirname(svg) + "_удалено", os.path.dirname(svg))
+    assert not windows or _norm(pic3.evaluatedPath()).startswith(_norm(alone)), pic3.evaluatedPath()
+    if not windows:
+        _move(src + "_удалено", src)
+        _move(os.path.dirname(svg) + "_удалено", os.path.dirname(svg))
 
     # 2. архив рядом с проектом
     zip_path = os.path.join(folder, "Проект ЛЭП_архив_2026-09-18.zip")
@@ -1161,6 +1173,11 @@ def _raster_gpkg(path, table, append=False):
     return path
 
 
+def _cloud_files(P):
+    """Файлы облака точек в проекте split_project: само облако и индекс, если он построен."""
+    return sorted(n for n in os.listdir(os.path.join(P, "data", "Облака")) if n.startswith("cloud."))
+
+
 def split_project(root):
     """Проект с растрами по всем правилам раскладки, GeoPackage трёх видов
     (растр + вектор, из которого берётся только растр; растр + вектор, оба
@@ -1224,7 +1241,10 @@ def split_project(root):
         QgsApplication.processEvents()
         import time
         time.sleep(0.1)
-    assert os.path.isfile(index), "QGIS не построил индекс облака за минуту"
+    if not os.path.isfile(index):
+        # QGIS 3.40 в Windows (GitHub Actions) индекс не строит — копия без него
+        assert sys.platform.startswith("win"), "QGIS не построил индекс облака за минуту"
+        print("      индекс облака точек QGIS здесь не построил — проверка без него")
     assert p.write(j(P, "Проект.qgz"))
     return p, P, home, L
 
@@ -1287,7 +1307,7 @@ def test_split_by_type():
     assert listing("raster", "Тайлы") == ["тайлы.gpkg"]
     assert _p(L["t2"].source()) == _p("GPKG:{}:t2".format(j(D, "raster", "Тайлы", "тайлы.gpkg")))
     # облако точек — с индексом QGIS; сетка
-    assert listing("pointcloud", "Облака") == ["cloud.copc.laz", "cloud.las"], listing("pointcloud", "Облака")
+    assert listing("pointcloud", "Облака") == _cloud_files(P), listing("pointcloud", "Облака")
     assert _p(L["cloud"].source()) == _p(j(D, "pointcloud", "Облака", "cloud.las"))
     assert _p(L["mesh"].source()) == _p(j(D, "mesh", "Сетка", "m.2dm"))
     # временный растр — в корень raster/
@@ -1510,7 +1530,7 @@ def test_split_by_type_crs_and_off():
     res = packager.consolidate_project(p, items, "native", crs=MSK, include_fonts=False,
                                        make_archive=False, keep_structure=True)
     assert res["results"] == [] and len(res["already"]) == 2, res
-    assert sorted(os.listdir(j(D, "pointcloud", "Облака"))) == ["cloud.copc.laz", "cloud.las"]
+    assert sorted(os.listdir(j(D, "pointcloud", "Облака"))) == _cloud_files(P)
     # без структуры папок сетка не собирается
     res = packager.consolidate_project(p, [(L["mesh"], "mesh", False)], "gpkg", include_fonts=False,
                                        make_archive=False)
@@ -1879,6 +1899,10 @@ def test_memory_layer_saver_not_loaded():
     assert [(l.name(), r) for l, r in saver.find_layers(p)[1]] == [("Старый", saver.MLS_NOT_LOADED)]
     with open(qgs + ".mldata", "r+b") as f:  # чужой заголовок — это не файл Memory Layer Saver
         f.write(b"X")
+    # размер тот же, а время изменения в Windows идёт шагами ~15 мс — сдвигаем, иначе
+    # проверяется кэш разбора, а не заголовок
+    st = os.stat(qgs + ".mldata")
+    os.utime(qgs + ".mldata", ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
     assert [l.name() for l, *_ in saver.find_layers(p)[0]] == ["Старый"]
     with open(qgs + ".mldata", "wb") as f:  # испорченный файл — не мешает сохранять
         f.write(b"QGis.MemoryLayerData\x00\x00\x00\x02\xff\xff")
@@ -2216,13 +2240,16 @@ def _unpack_with_system_tools(zip_path, dest):
             "PowerShell": "Expand-Archive -LiteralPath $env:ZIP -DestinationPath $env:DEST -Force",
             # Проводник: копирование из «сжатой папки» оболочки Windows (zipfldr)
             "Проводник": ("$s = New-Object -ComObject Shell.Application; "
-                          "$s.NameSpace($env:DEST).CopyHere($s.NameSpace($env:ZIP).Items(), 4 + 16 + 1024); "
+                          "$d = $s.NameSpace($env:DEST); $z = $s.NameSpace($env:ZIP); "
+                          "if ($d -eq $null -or $z -eq $null) { exit 3 }; "
+                          "$d.CopyHere($z.Items(), 4 + 16 + 1024); "
                           "$n = (Get-Item -LiteralPath $env:ZIP).Length; $t = 0; "
                           "while ($t -lt 120) { Start-Sleep 1; $t++; "
                           "$m = (Get-ChildItem -LiteralPath $env:DEST -Recurse -File | Measure-Object).Count; "
                           "if ($m -ge [int]$env:COUNT) { break } }"),
         }
         count = str(len([n for n in zipfile.ZipFile(zip_path).namelist() if not n.endswith("/")]))
+        zip_path = os.path.normpath(zip_path)  # оболочке Windows нужны «\\»
         for how, script in scripts.items():
             d = os.path.join(dest, how)
             os.makedirs(d, exist_ok=True)
@@ -2232,7 +2259,10 @@ def _unpack_with_system_tools(zip_path, dest):
             run = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", script],
                                  env=env, capture_output=True, timeout=300)
             err = run.stderr.decode("utf-8", "replace").strip()
-            out[how] = d if run.returncode == 0 and not err else "ошибка: " + (err or str(run.returncode))
+            if run.returncode == 3:  # без рабочего стола (служба GitHub Actions) Проводника нет
+                out[how] = "не проверено: нет оболочки Windows"
+            else:
+                out[how] = d if run.returncode == 0 and not err else "ошибка: " + (err or str(run.returncode))
     elif sys.platform == "darwin":
         d = os.path.join(dest, "ditto")
         run = subprocess.run(["ditto", "-x", "-k", zip_path, d], capture_output=True)
@@ -2272,6 +2302,9 @@ def test_windows_archive_unpack():
         assert any("ЗОУИТ и ООПТ/Охранная зона №1.gpkg" in n for n in names), names
         top = os.path.splitext(os.path.basename(res["zip"]))[0]
         for how, d in _unpack_with_system_tools(res["zip"], j(root, "распаковано")).items():
+            if d.startswith("не проверено"):
+                print("      распаковка ({}): {}".format(how, d))
+                continue
             assert not d.startswith("ошибка"), (how, d)
             got = set()
             for folder, _dirs, files in os.walk(d):

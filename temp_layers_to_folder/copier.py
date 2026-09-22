@@ -116,6 +116,89 @@ def external_subdir(src_dir, home=None, max_depth=MAX_EXTERNAL_DEPTH, pm=os.path
     return "/".join(prefix + parts)
 
 
+# ------------------------------------------------------------ длинные пути
+
+MIN_DIR_NAME = 8   # названия папок не обрезаются короче
+_NAME_MARGIN = 7   # «_12» у имени файла, если исходное занято, и «-wal» открытого GeoPackage
+SHORTENED_NOTE = "названия папок сокращены: иначе путь длиннее {} знаков и в Windows не открывается"
+FLAT_NOTE = ("путь длиннее {} знаков даже с сокращёнными названиями папок — файл положен прямо "
+             "в data_all")
+
+
+def _cap(lengths, need):
+    """Наибольшая длина названия (не меньше MIN_DIR_NAME), при обрезке до которой
+    названия длиной lengths укоротят путь хотя бы на need знаков; None — не выйдет."""
+    for cap in range(max(lengths, default=0) - 1, MIN_DIR_NAME - 1, -1):
+        if sum(max(0, n - cap) for n in lengths) >= need:
+            return cap
+    return None
+
+
+class PathShortener:
+    """Сокращает названия подпапок data_all, если путь к файлу вышел бы длиннее
+    saver.MAX_PATH: такие файлы в Windows не создаются и не открываются, а data_all
+    собирают, чтобы передать дальше. Обрезаются самые длинные названия, ровно
+    настолько, чтобы путь поместился; папки модуля (external_links, raster…) не
+    трогаются. В одном запуске одна и та же исходная папка получает одно короткое имя,
+    а разные исходные папки с одинаковым началом — разные («~2», «~3»)."""
+
+    KEEP = {EXTERNAL_DIR.lower()} | {d.lower() for d in TYPE_DIRS.values()}
+
+    def __init__(self, data_dir, limit=None):
+        self.data_dir = os.path.abspath(data_dir)
+        self.limit = saver.MAX_PATH if limit is None else limit
+        self.short = {}  # {исходный путь от data_all (кортеж): короткое название последней папки}
+        self.used = {}   # {короткий путь родителя (кортеж): занятые названия в нижнем регистре}
+
+    def subdir(self, sub, longest_name):
+        """(подпапка, сокращена ли) вместо sub («a/b/c»), чтобы в ней поместился файл с
+        именем длиной longest_name; None — не помещается и с сокращёнными названиями."""
+        parts = [p for p in sub.split("/") if p]
+        fixed = []  # начало пути, уже встречавшееся в этом запуске, — с тем же названием
+        while len(fixed) < len(parts) and tuple(parts[:len(fixed) + 1]) in self.short:
+            fixed.append(self.short[tuple(parts[:len(fixed) + 1])])
+        free = parts[len(fixed):]
+        total = (len(self.data_dir) + sum(len(p) + 1 for p in fixed + free)
+                 + 1 + longest_name + _NAME_MARGIN)
+        cap = None
+        if total > self.limit:
+            cap = _cap([len(p) for p in free if p.lower() not in self.KEEP], total - self.limit)
+            if cap is None:
+                return None
+        out = list(fixed)
+        for i in range(len(fixed), len(parts)):
+            name = parts[i]
+            if cap is not None and len(name) > cap and name.lower() not in self.KEEP:
+                name = self._free_name(tuple(out), name, cap)
+            self.short[tuple(parts[:i + 1])] = name
+            self.used.setdefault(tuple(out), set()).add(name.lower())
+            out.append(name)
+        return "/".join(out), out != parts
+
+    def _free_name(self, parent, name, cap):
+        used = self.used.get(parent, set())
+        # пробел и точка в конце названия папки в Windows недопустимы
+        short = name[:cap].rstrip(" .") or name[:cap]
+        n = 1
+        while short.lower() in used:
+            n += 1
+            suffix = "~{}".format(n)
+            short = name[:cap - len(suffix)].rstrip(" .") + suffix
+        return short
+
+
+def _longest_name(path, types=()):
+    """Длина самого длинного пути от папки назначения среди копий файла path
+    (со спутниками) или файлов внутри папки path."""
+    main = os.path.basename(os.path.normpath(path))
+    if os.path.isdir(path):
+        inside = [len(os.path.relpath(os.path.join(folder, f), path))
+                  for folder, _dirs, files in os.walk(path) for f in files]
+        return len(main) + 1 + max(inside, default=0)
+    names = companion_names(path, "raster" in types, "pointcloud" in types)
+    return max(len(n) for n in names or [main])
+
+
 def target_subdir(src_dir, project_dir, data_dir=None, home=None, max_depth=MAX_EXTERNAL_DEPTH,
                   pm=os.path, kind=""):
     """Подпапка data_all для файла из папки src_dir (пустая строка — сама data_all).
@@ -288,13 +371,15 @@ def _key(path):
 
 def copy_layers(project, items, data_dir, project_dir, progress=None, is_cancelled=None,
                 home=None, max_depth=MAX_EXTERNAL_DEPTH, split_by_type=SPLIT_BY_TYPE,
-                structure=True):
+                structure=True, shortener=None):
     """Копирует файлы слоёв items = [(layer, kind, temporary)] в data_dir и
     переключает на них слои. Слои без Source сюда не передаются. structure —
     раскладывать по подпапкам исходных файлов; без неё всё ложится прямо в
     data_dir. split_by_type — растры, облака точек и сетки в свои папки
-    (raster/, pointcloud/, mesh/). Возвращает результаты в формате saver.save_layers."""
+    (raster/, pointcloud/, mesh/). shortener — общий на всю сборку PathShortener.
+    Возвращает результаты в формате saver.save_layers."""
     real_data = os.path.realpath(data_dir)
+    shortener = shortener or PathShortener(data_dir)
     sources, types = {}, {}  # {id слоя: Source}, {исходный файл/папка: типы данных его слоёв}
     for layer, kind, _temporary in items:
         src = sources[layer.id()] = layer_source(layer)
@@ -320,7 +405,7 @@ def copy_layers(project, items, data_dir, project_dir, progress=None, is_cancell
                 copies[key] = _copy_unit(src.path, types[key], data_dir, real_data, project_dir, taken,
                                          home, max_depth,
                                          unit_type(types[key], src.path) if split_by_type else "",
-                                         structure)
+                                         structure, shortener)
             dest, note = copies[key]
             uri = src.uri(dest)
             old, crs = layer.source(), layer.crs()
@@ -333,7 +418,7 @@ def copy_layers(project, items, data_dir, project_dir, progress=None, is_cancell
         except saver.Cancelled:
             raise
         except Exception as e:  # noqa: BLE001 — продолжаем с остальными слоями
-            res["message"] = str(e)
+            res["message"] = saver.error_text(e)
         results.append(res)
     if progress:
         progress(total, total, "")
@@ -343,16 +428,30 @@ def copy_layers(project, items, data_dir, project_dir, progress=None, is_cancell
 
 
 def _copy_unit(path, types, data_dir, real_data, project_dir, taken, home, max_depth, kind,
-               structure=True):
+               structure=True, shortener=None):
     """Копирует файл или папку в подпапку по правилам раскладки (kind — папка
-    типа данных или пустая строка; structure — раскладывать по подпапкам);
-    возвращает (путь копии, замечание)."""
+    типа данных или пустая строка; structure — раскладывать по подпапкам; shortener —
+    PathShortener для слишком длинных путей); возвращает (путь копии, замечание)."""
     if os.path.isdir(path) and saver.relative_inside(real_data, path) is not None:
         raise RuntimeError("папка-источник содержит саму data_all — скопировать её нельзя")
     sub = target_subdir(os.path.dirname(os.path.normpath(path)), project_dir, data_dir, home, max_depth,
                         kind=kind) if structure else ""
+    sub, short_note = shorten_subdir(shortener, sub, _longest_name(path, types))
     dest_dir = os.path.join(data_dir, *sub.split("/")) if sub else data_dir
-    return copy_into(path, dest_dir, taken, types)
+    dest, note = copy_into(path, dest_dir, taken, types)
+    return dest, "; ".join(filter(None, [note, short_note]))
+
+
+def shorten_subdir(shortener, sub, longest_name):
+    """(подпапка, замечание): sub или сокращённая shortener подпапка; если путь не
+    помещается и так — сама data_all."""
+    if not sub or shortener is None:
+        return sub, ""
+    got = shortener.subdir(sub, longest_name)
+    if got is None:
+        return "", FLAT_NOTE.format(shortener.limit)
+    short, cut = got
+    return short, SHORTENED_NOTE.format(shortener.limit) if cut else ""
 
 
 def copy_into(path, dest_dir, taken, types=(), stem=None):

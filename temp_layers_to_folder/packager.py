@@ -514,28 +514,38 @@ def consolidate_project(project, items, fmt_key, crs=None, save_styles=True, inc
     blocked = [_result(it[0], copier.copy_obstacle(it[0]) if native else
                        "облака точек и сетки собираются только с родными форматами файлов")
                for it in rest if it[1] in copier.AS_IS_ONLY]
+    shortener = copier.PathShortener(target)  # одна на всю сборку: одна папка — одно короткое имя
+    short_notes = {}
     if keep_structure:
         subdirs, names = {}, {}
+        ext = ".{}-wal".format(saver.FORMATS_BY_KEY[fmt_key]["ext"])  # самый длинный из файлов слоя
         for layer, kind, temporary in to_convert:
             kind_dir = copier.data_type(kind) if split else ""
             src = "" if temporary else source_path(layer)
             if src:  # на место исходного файла и под его именем: мозаика.vrt → мозаика.tif
                 folder = src if os.path.isdir(src) else os.path.dirname(os.path.abspath(src))
-                subdirs[layer.id()] = copier.target_subdir(folder, project_dir, target, kind=kind_dir)
                 names[layer.id()] = _file_stem(layer)
+                sub = copier.target_subdir(folder, project_dir, target, kind=kind_dir)
+                subdirs[layer.id()], short_notes[layer.id()] = copier.shorten_subdir(
+                    shortener, sub, len(saver.safe_name(names[layer.id()])) + len(ext))
             elif kind_dir in copier.TYPE_DIRS:  # временный растр — в data_all/raster
                 subdirs[layer.id()] = copier.TYPE_DIRS[kind_dir]
-    results = blocked + saver.save_layers(
+    converted = saver.save_layers(
         project, to_convert, target, fmt_key, gpkg_name=project_base_name(project), replace=True,
         save_styles=save_styles, overwrite=False, crs=use_crs,
         progress=lambda i, total, n: step(len(already) + i, n), is_cancelled=is_cancelled,
         subdirs=subdirs, names=names)
+    for r in converted:
+        if r["ok"] and short_notes.get(r["id"]):
+            r["message"] = "; ".join(filter(None, [r["message"], short_notes[r["id"]]]))
+    results = blocked + converted
     if to_copy:
         kept_crs = {it[0].id() for it in to_copy if _needs_crs(it[0], use_crs)}  # облака точек и сетки
         copied = copier.copy_layers(
             project, to_copy, target, project_dir,
             progress=lambda i, total, n: step(len(already) + len(to_convert) + i, n),
-            is_cancelled=is_cancelled, split_by_type=split, structure=keep_structure)
+            is_cancelled=is_cancelled, split_by_type=split, structure=keep_structure,
+            shortener=shortener)
         for r in copied:
             if r["ok"] and r["id"] in kept_crs:
                 r["message"] = "; ".join(m for m in (r["message"], "система координат не изменена — "

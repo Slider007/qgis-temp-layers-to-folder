@@ -2115,45 +2115,104 @@ def test_windows_other_drive():
 
 
 def test_windows_long_paths():
-    """Путь копии длиннее 260 знаков, исходный короче (Windows без включённых длинных
-    путей такую папку не создаст): слой либо собран и читается из data_all, либо
-    остался на исходном файле с сообщением об ошибке. Сборка не обрывается, проект
-    сохраняется и открывается со всеми объектами."""
-    from temp_layers_to_folder import packager
+    """Путь копии в data_all длиннее 259 знаков (в Windows такие файлы не создаются и не
+    открываются), исходный короче: названия папок в data_all сокращаются, чтобы путь
+    поместился, — и при копировании как есть, и при переводе в GeoPackage. Слой
+    собран, в журнале — почему папки короче; проект открывается со всеми объектами."""
+    from temp_layers_to_folder import copier, packager
 
     j = os.path.join
     base = j(OUT, "длинные")
     home = j(base, "дом")
-    P = j(base, "Проект ВЛ 220 кВ Северная")
     tail = len(os.sep + "опоры.gpkg")
     n = max(10, min(60, (240 - len(home) - tail) // 3 - 1))
-    levels = ["уровень {} ".format(i).ljust(n, "ж") for i in (1, 2, 3)]
-    src = _vector_file(j(home, *levels, "опоры.gpkg"), "GPKG", n=3)
-    target = j(P, "data_all", "external_links", *levels, "опоры.gpkg")
-    print("      длина пути: исходный {}, копия {}".format(len(src), len(target)))
-    assert len(src) < 250 and len(target) > 260
-    proj = j(P, "Проект.qgz")
-    try:
-        p, layer = _one_layer_project(src, "Опоры", proj)
-        items, _ = saver.find_layers(p, temporary_only=False)
-        with _Home(home):
-            res = packager.consolidate_project(p, items, "native", include_fonts=False,
-                                               keep_structure=True, make_archive=False)
-        (r,) = res["results"]
-        if r["ok"]:
-            assert _norm(_layer_file(layer)) == _norm(target), layer.source()
-            assert os.path.isfile(target)
-        else:
-            assert r["message"], r
-            assert _norm(_layer_file(layer)) == _norm(src), layer.source()
-        print("      собран: {} {}".format(r["ok"], r["message"][:150]))
-        assert layer.isValid() and layer.featureCount() == 3
-        p2 = QgsProject()
-        assert p2.read(proj)
-        l2 = p2.mapLayer(layer.id())
-        assert l2.isValid() and l2.featureCount() == 3, l2.source()
-    finally:
-        QgsProject.instance().clear()
+    for fmt in ("native", "gpkg"):
+        levels = ["{} уровень {} ".format(fmt, i).ljust(n, "ж") for i in (1, 2, 3)]
+        src = _vector_file(j(home, *levels, "опоры.gpkg"), "GPKG", n=3)
+        P = j(base, "Проект ВЛ 220 кВ Северная " + fmt)
+        full = j(P, "data_all", "external_links", *levels, "опоры.gpkg")
+        assert len(src) < 250 and len(full) > saver.MAX_PATH, (len(src), len(full))
+        proj = j(P, "Проект.qgz")
+        try:
+            p, layer = _one_layer_project(src, "Опоры", proj)
+            items, _ = saver.find_layers(p, temporary_only=False)
+            with _Home(home):
+                res = packager.consolidate_project(p, items, fmt, include_fonts=False,
+                                                   keep_structure=True, make_archive=False)
+            (r,) = res["results"]
+            path = _layer_file(layer)
+            print("      {}: исходный путь {}, полный {}, после сокращения {}".format(
+                fmt, len(src), len(full), len(os.path.abspath(path))))
+            assert r["ok"], r
+            assert copier.SHORTENED_NOTE.format(saver.MAX_PATH) in r["message"], r["message"]
+            assert len(os.path.abspath(path)) + len("-wal") <= saver.MAX_PATH, path
+            rel = os.path.relpath(path, j(P, "data_all")).split(os.sep)
+            assert rel[0] == "external_links" and len(rel) == 5, rel  # те же три папки
+            assert all(len(a) < len(b) and b.startswith(a) for a, b in zip(rel[1:4], levels)), rel
+            assert os.path.isfile(path) and layer.isValid() and layer.featureCount() == 3
+            p2 = QgsProject()
+            assert p2.read(proj)
+            l2 = p2.mapLayer(layer.id())
+            assert l2.isValid() and l2.featureCount() == 3, l2.source()
+        finally:
+            QgsProject.instance().clear()
+
+
+def test_path_shortener():
+    """Сокращаются только подпапки, из-за которых путь к файлу длиннее предела: самые
+    длинные названия, ровно насколько нужно; папки модуля не трогаются; в одном запуске
+    одна исходная папка — одно короткое имя, разные с одинаковым началом — разные;
+    пробела и точки в конце названия нет (в Windows нельзя)."""
+    from temp_layers_to_folder import copier
+
+    data = os.path.join(OUT, "сокращение", "data_all")
+    base = len(os.path.abspath(data))
+    margin = copier._NAME_MARGIN
+
+    def fits(sub, name, limit):
+        return base + 1 + len(sub) + 1 + name + margin <= limit
+
+    s = copier.PathShortener(data, limit=base + 70)
+    assert s.subdir("ЛЕС/2024", 10) == ("ЛЕС/2024", False)  # помещается — без изменений
+    long = "external_links/Очень длинное название папки/Ещё одна папка/x"
+    sub, cut = s.subdir(long, 10)
+    parts = sub.split("/")
+    assert cut and fits(sub, 10, base + 70) and not fits(long, 10, base + 70), sub
+    assert parts[0] == "external_links" and parts[2:] == ["Ещё одна папка", "x"], parts  # самое длинное
+    assert parts[1] == "Очень длинное назва", parts  # ровно на столько, сколько не хватало
+    assert s.subdir(long, 10) == (sub, True)  # та же папка — то же имя
+    sib = s.subdir("external_links/Очень длинное название папки/Соседняя", 10)[0]
+    assert sib.split("/")[:2] == parts[:2], sib  # соседняя — под тем же сокращённым родителем
+    # обрезка приходится на «2026. » — пробел и точка в конце убираются
+    a = s.subdir("Поворотные точки 2026. вариант первый/файлы", 32)[0].split("/")[0]
+    b = s.subdir("Поворотные точки 2026. вариант второй/файлы", 32)[0].split("/")[0]
+    assert (a, b) == ("Поворотные точки 2026", "Поворотные точки 2026~2"), (a, b)
+    tight = copier.PathShortener(data, limit=base + 50)  # external_links пришлось бы резать
+    assert tight.subdir("external_links/Очень длинное название папки/x", 16)[0] == "external_links/Очень дл/x"
+    assert s.subdir("external_links/raster/x", 60) is None  # сокращать нечего
+    assert copier.shorten_subdir(s, "external_links/raster/x", 60) == (
+        "", copier.FLAT_NOTE.format(base + 70))  # тогда — прямо в data_all
+    assert copier.shorten_subdir(None, "a/b", 500) == ("a/b", "")
+
+
+def test_error_text():
+    """Ошибки Windows «путь слишком длинный» и «файл занят» в журнале — по-русски."""
+
+    class WinError(OSError):
+        def __init__(self, code, filename):
+            super().__init__(2, "system message", filename)
+            self.code = code
+
+        @property
+        def winerror(self):
+            return self.code
+
+    busy = os.path.join(OUT, "Черновик.gpkg")
+    assert saver.error_text(WinError(3, "C:" + os.sep + "п" * 250)) == saver.LONG_PATH
+    assert saver.error_text(WinError(206, busy)) == saver.LONG_PATH
+    assert saver.error_text(WinError(3, busy)) == str(WinError(3, busy))  # просто нет папки
+    assert saver.error_text(WinError(32, busy)) == saver.BUSY_FILE.format("Черновик.gpkg")
+    assert saver.error_text(RuntimeError("что-то другое")) == "что-то другое"
 
 
 class _Busy:
@@ -2214,6 +2273,8 @@ def test_windows_busy_file():
             (r,) = res
             print("      занятый файл: сохранён {}, путь {!r}, сообщение {!r}".format(
                 r["ok"], os.path.basename(r["path"].split(" → ")[0]), r["message"][:150]))
+            if sys.platform.startswith("win"):  # занятый файл в Windows не заменить
+                assert not r["ok"] and r["message"] == saver.NOT_REPLACED.format("Черновик.gpkg"), r
             if r["ok"]:
                 assert mem.providerType() == "ogr" and mem.featureCount() == 4, mem.source()
             else:

@@ -3,6 +3,7 @@
 import os
 import re
 import shutil
+import sys
 
 from qgis.core import (
     Qgis,
@@ -58,6 +59,33 @@ FORMATS_BY_KEY = {f["key"]: f for f in FORMATS}
 
 # Спутниковые файлы Shapefile: при проверке «файл уже существует» смотрим на все.
 _SHP_PARTS = (".shp", ".shx", ".dbf", ".prj", ".cpg", ".qml")
+
+# Самый длинный путь к файлу, который создают и открывают Windows и QGIS в ней
+# (MAX_PATH = 260 вместе с завершающим нулём; папка — до 247 знаков).
+MAX_PATH = 259
+_MAX_DIR_PATH = 247
+
+LONG_PATH = ("путь длиннее {} знаков — в Windows такие папки и файлы не создаются: перенесите "
+             "проект или папку сохранения ближе к корню диска или сократите названия папок"
+             ).format(MAX_PATH)
+BUSY_FILE = ("файл «{}» занят другой программой (например, Яндекс.Диском или вторым QGIS) — "
+             "закройте её и повторите")
+NOT_REPLACED = ("не удалось заменить файл «{}»: он занят другой программой (например, "
+                "Яндекс.Диском или вторым QGIS) или защищён от записи")
+
+
+def error_text(error, path=""):
+    """Текст ошибки для журнала. Ошибки Windows «путь слишком длинный» и «файл занят»
+    объясняются по-русски, остальные — как есть."""
+    code = getattr(error, "winerror", None)
+    where = getattr(error, "filename", None) or path or ""
+    # ERROR_PATH_NOT_FOUND у папки длиннее предела, ERROR_FILENAME_EXCED_RANGE
+    if code == 206 or (code == 3 and len(where) > _MAX_DIR_PATH):
+        return LONG_PATH
+    if code in (32, 33):  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+        return BUSY_FILE.format(os.path.basename(where))
+    return str(error)
+
 
 _INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -440,6 +468,10 @@ def _write_vector(layer, path, driver, layer_name, action, transform_context, ct
     if error != WRITER_OK:
         if created:  # пустой файл от неудачной записи не оставляем
             _remove_file_set(path, driver)
+        if sys.platform.startswith("win") and len(os.path.abspath(path)) > MAX_PATH:
+            raise RuntimeError(LONG_PATH)
+        if action == CREATE_FILE and os.path.exists(path):  # GDAL не смог удалить прежний файл
+            raise RuntimeError(NOT_REPLACED.format(os.path.basename(path)))
         raise RuntimeError(message or "ошибка записи (код {})".format(error))
     return new_file, new_layer
 
@@ -767,7 +799,7 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
         except Cancelled:
             raise
         except Exception as e:  # noqa: BLE001 — продолжаем с остальными слоями
-            res["message"] = str(e)
+            res["message"] = error_text(e)
         if notes:
             res["message"] = "; ".join(filter(None, [res["message"]] + notes))
         results.append(res)

@@ -548,7 +548,7 @@ def test_consolidate_project():
 
     # 2. архив рядом с проектом
     zip_path = os.path.join(folder, "Проект ЛЭП_архив_2026-09-18.zip")
-    assert res["zip"] == zip_path and os.path.isfile(zip_path)
+    assert _p(res["zip"]) == _p(zip_path) and os.path.isfile(zip_path)
     names = zipfile.ZipFile(zip_path).namelist()
     root = "Проект ЛЭП_архив_2026-09-18/"
     for rel in ("Проект ЛЭП.qgz", "data_all/Черновик.gpkg", "data_all/Опоры.gpkg",

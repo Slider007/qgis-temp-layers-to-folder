@@ -48,7 +48,14 @@ app.initQgis()
 # initQgis() переносит настройки в ~/Library/Application Support/<организация>/…/profiles/default,
 # которую никто не чистит: возвращаем их во временный профиль.
 QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, PROFILE)
-assert QSettings().fileName().startswith(PROFILE), QSettings().fileName()
+
+
+def _norm(path):
+    """Путь для сравнения: в Windows Qt и QGIS пишут «D:/…», а os.path — «D:\\…»."""
+    return os.path.normcase(os.path.normpath(path))
+
+
+assert _norm(QSettings().fileName()).startswith(_norm(PROFILE)), QSettings().fileName()
 _PLUGIN_MENU = QMenu("Модули")  # меню «Модули» для поддельного iface
 
 from osgeo import gdal, ogr, osr  # noqa: E402
@@ -341,7 +348,10 @@ def _font_by_license(kind):
     """Файл системного шрифта с нужным видом лицензии и его семейство."""
     from temp_layers_to_folder import fonts
 
-    for path in sorted(glob.glob("/System/Library/Fonts/Supplemental/*.ttf")):
+    paths = sorted(glob.glob("/System/Library/Fonts/Supplemental/*.ttf"))
+    for d in fonts.font_dirs():  # в Windows — C:\Windows\Fonts и шрифты пользователя
+        paths += sorted(glob.glob(os.path.join(d, "*.[tT][tT][fF]")))
+    for path in paths:
         fams, lic, copyright_text, fs_type = fonts.read_font(path)
         if fams and fonts.license_kind(lic, copyright_text, fs_type) == kind:
             return path, sorted(fams)[0]
@@ -747,17 +757,25 @@ def structure_project(root):
 
 
 class _Home:
-    """Домашняя папка на время проверки: внешние пути считаются от неё."""
+    """Домашняя папка на время проверки: внешние пути считаются от неё
+    (os.path.expanduser берёт её из HOME, а в Windows — из USERPROFILE)."""
+
+    NAMES = ("HOME", "USERPROFILE")
 
     def __init__(self, path):
-        self.path, self.old = path, None
+        self.path, self.old = path, {}
 
     def __enter__(self):
-        self.old = os.environ.get("HOME")
-        os.environ["HOME"] = self.path
+        for name in self.NAMES:
+            self.old[name] = os.environ.get(name)
+            os.environ[name] = self.path
 
     def __exit__(self, *exc):
-        os.environ["HOME"] = self.old
+        for name, value in self.old.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def test_structure_paths():
@@ -1960,6 +1978,274 @@ def test_plugin_window_non_modal():
     assert plugin.dialog is d and d.isVisible()
     plugin.unload()
     assert plugin.dialog is None and not d.isVisible()
+
+
+# ------------------------------------------------------------------ Windows
+# Проверки идут на любой системе, но написаны ради Windows (.github/workflows/windows.yml):
+# другой диск, путь длиннее 260 знаков, файл, занятый другой программой, распаковка
+# архива штатными средствами. Лишние строки в выводе показывают, что вышло на этой системе.
+
+def _one_layer_project(src, name, proj):
+    p = QgsProject.instance()
+    p.clear()
+    layer = QgsVectorLayer(src, name, "ogr")
+    assert layer.isValid(), src
+    p.addMapLayer(layer)
+    os.makedirs(os.path.dirname(proj), exist_ok=True)
+    assert p.write(proj)
+    return p, layer
+
+
+def _layer_file(layer):
+    return layer.source().split("|")[0]
+
+
+def _other_drive_folder():
+    """Папка на другом диске, чем tests/_out (в GitHub Actions проект на D:, а C: свободен),
+    но не во временной папке системы: слои оттуда QGIS считает временными. Где второго
+    диска нет — просто папка вне проекта."""
+    if sys.platform.startswith("win"):
+        own = os.path.splitdrive(os.path.abspath(OUT))[0].upper()
+        for drive in ("C:", "D:"):
+            if drive != own and os.path.isdir(drive + os.sep):
+                path = os.path.join(drive + os.sep, "temp-layers-tests внешние")
+                try:
+                    os.makedirs(path, exist_ok=True)
+                    return path
+                except OSError:
+                    pass
+    return os.path.join(OUT, "внешние")
+
+
+def test_windows_other_drive():
+    """Файл слоя на другом диске, чем проект (между дисками os.path.relpath бросает
+    ValueError): сборка со структурой кладёт его в data_all/external_links, архив
+    собирается, проект открывается."""
+    import zipfile
+
+    from temp_layers_to_folder import packager
+
+    j = os.path.join
+    P = j(OUT, "другой диск", "Проект")
+    ext = _other_drive_folder()
+    try:
+        src = _vector_file(j(ext, "Опоры", "опоры.gpkg"), "GPKG", n=3)
+        if sys.platform.startswith("win") and os.environ.get("CI"):  # в GitHub Actions — обязательно
+            assert os.path.splitdrive(src)[0].upper() != os.path.splitdrive(P)[0].upper(), (src, P)
+        p, layer = _one_layer_project(src, "Опоры", j(P, "Проект.qgz"))
+        items, skipped = saver.find_layers(p, temporary_only=False)
+        assert not skipped, skipped
+        res = packager.consolidate_project(p, items, "native", include_fonts=False, keep_structure=True)
+        assert all(r["ok"] for r in res["results"]), res["results"]
+        path = _layer_file(layer)
+        assert _norm(path).startswith(_norm(j(P, "data_all", "external_links")) + os.sep), path
+        assert layer.isValid() and layer.featureCount() == 3
+        print("      диск исходника {!r}, проекта {!r} → {}".format(
+            os.path.splitdrive(src)[0], os.path.splitdrive(P)[0], os.path.relpath(path, P)))
+        assert any(n.endswith("/опоры.gpkg") for n in zipfile.ZipFile(res["zip"]).namelist())
+        p2 = QgsProject()
+        assert p2.read(j(P, "Проект.qgz"))
+        l2 = p2.mapLayer(layer.id())
+        assert l2.isValid() and l2.featureCount() == 3, l2.source()
+    finally:
+        QgsProject.instance().clear()
+        shutil.rmtree(ext, ignore_errors=True)
+
+
+def test_windows_long_paths():
+    """Путь копии длиннее 260 знаков, исходный короче (Windows без включённых длинных
+    путей такую папку не создаст): слой либо собран и читается из data_all, либо
+    остался на исходном файле с сообщением об ошибке. Сборка не обрывается, проект
+    сохраняется и открывается со всеми объектами."""
+    from temp_layers_to_folder import packager
+
+    j = os.path.join
+    base = j(OUT, "длинные")
+    home = j(base, "дом")
+    P = j(base, "Проект ВЛ 220 кВ Северная")
+    tail = len(os.sep + "опоры.gpkg")
+    n = max(10, min(60, (240 - len(home) - tail) // 3 - 1))
+    levels = ["уровень {} ".format(i).ljust(n, "ж") for i in (1, 2, 3)]
+    src = _vector_file(j(home, *levels, "опоры.gpkg"), "GPKG", n=3)
+    target = j(P, "data_all", "external_links", *levels, "опоры.gpkg")
+    print("      длина пути: исходный {}, копия {}".format(len(src), len(target)))
+    assert len(src) < 250 and len(target) > 260
+    proj = j(P, "Проект.qgz")
+    try:
+        p, layer = _one_layer_project(src, "Опоры", proj)
+        items, _ = saver.find_layers(p, temporary_only=False)
+        with _Home(home):
+            res = packager.consolidate_project(p, items, "native", include_fonts=False,
+                                               keep_structure=True, make_archive=False)
+        (r,) = res["results"]
+        if r["ok"]:
+            assert _norm(_layer_file(layer)) == _norm(target), layer.source()
+            assert os.path.isfile(target)
+        else:
+            assert r["message"], r
+            assert _norm(_layer_file(layer)) == _norm(src), layer.source()
+        print("      собран: {} {}".format(r["ok"], r["message"][:150]))
+        assert layer.isValid() and layer.featureCount() == 3
+        p2 = QgsProject()
+        assert p2.read(proj)
+        l2 = p2.mapLayer(layer.id())
+        assert l2.isValid() and l2.featureCount() == 3, l2.source()
+    finally:
+        QgsProject.instance().clear()
+
+
+class _Busy:
+    """Файл, открытый другой программой без общего доступа (как Яндекс.Диск при
+    синхронизации или второй QGIS). В Windows его нельзя ни удалить, ни перезаписать;
+    на других системах такой блокировки нет — файл просто остаётся открытым."""
+
+    def __init__(self, path):
+        self.path, self.handle, self.fh = path, None, None
+
+    def __enter__(self):
+        if sys.platform.startswith("win"):
+            import ctypes
+            from ctypes import wintypes
+
+            create = ctypes.windll.kernel32.CreateFileW
+            create.restype = wintypes.HANDLE
+            create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                               wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+            # GENERIC_READ, без общего доступа, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL
+            self.handle = create(self.path, 0x80000000, 0, None, 3, 0x80, None)
+            assert self.handle not in (None, wintypes.HANDLE(-1).value), ctypes.GetLastError()
+        else:
+            self.fh = open(self.path, "rb")
+        return self
+
+    def __exit__(self, *exc):
+        if self.handle is not None:
+            import ctypes
+
+            ctypes.windll.kernel32.CloseHandle(self.handle)
+        if self.fh is not None:
+            self.fh.close()
+
+
+def test_windows_busy_file():
+    """Сохранение временного слоя с перезаписью поверх файла, занятого другой программой:
+    либо файл перезаписан и слой переключён на него, либо слой остался в памяти со
+    всеми объектами и с сообщением об ошибке — без обрыва и без пустых файлов."""
+    j = os.path.join
+    folder = j(OUT, "занятый файл")
+    busy = _vector_file(j(folder, "Черновик.gpkg"), "GPKG", n=1)
+    size = os.path.getsize(busy)
+    p = QgsProject.instance()
+    p.clear()
+    mem = QgsVectorLayer("Point?crs=EPSG:4326&field=n:integer", "Черновик", "memory")
+    feats = []
+    for i in range(4):
+        f = QgsFeature(mem.fields())
+        f.setAttributes([i])
+        f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(39.1 + i / 10, 48.5)))
+        feats.append(f)
+    mem.dataProvider().addFeatures(feats)
+    p.addMapLayer(mem)
+    try:
+        with _Busy(busy):
+            res = saver.save_layers(p, [(mem, "vector", True)], folder, "gpkg", overwrite=True)
+            (r,) = res
+            print("      занятый файл: сохранён {}, путь {!r}, сообщение {!r}".format(
+                r["ok"], os.path.basename(r["path"].split(" → ")[0]), r["message"][:150]))
+            if r["ok"]:
+                assert mem.providerType() == "ogr" and mem.featureCount() == 4, mem.source()
+            else:
+                assert r["message"], r
+                assert mem.providerType() == "memory" and mem.featureCount() == 4
+                assert os.path.getsize(busy) == size  # занятый файл не тронут
+        if not r["ok"]:  # пустой файл от неудачной записи не остался
+            left = sorted(n for n in os.listdir(folder) if not n.endswith(("-wal", "-shm")))
+            assert left == ["Черновик.gpkg"], left
+    finally:
+        QgsProject.instance().clear()
+
+
+def _unpack_with_system_tools(zip_path, dest):
+    """Распаковывает архив так, как это сделает пользователь: в Windows — PowerShell
+    (Expand-Archive) и Проводником, в macOS — как Finder (ditto). Возвращает
+    {способ: папка или текст ошибки}."""
+    import subprocess
+    import zipfile
+
+    out = {}
+    if sys.platform.startswith("win"):
+        scripts = {
+            "PowerShell": "Expand-Archive -LiteralPath $env:ZIP -DestinationPath $env:DEST -Force",
+            # Проводник: копирование из «сжатой папки» оболочки Windows (zipfldr)
+            "Проводник": ("$s = New-Object -ComObject Shell.Application; "
+                          "$s.NameSpace($env:DEST).CopyHere($s.NameSpace($env:ZIP).Items(), 4 + 16 + 1024); "
+                          "$n = (Get-Item -LiteralPath $env:ZIP).Length; $t = 0; "
+                          "while ($t -lt 120) { Start-Sleep 1; $t++; "
+                          "$m = (Get-ChildItem -LiteralPath $env:DEST -Recurse -File | Measure-Object).Count; "
+                          "if ($m -ge [int]$env:COUNT) { break } }"),
+        }
+        count = str(len([n for n in zipfile.ZipFile(zip_path).namelist() if not n.endswith("/")]))
+        for how, script in scripts.items():
+            d = os.path.join(dest, how)
+            os.makedirs(d, exist_ok=True)
+            env = dict(os.environ, ZIP=zip_path, DEST=d, COUNT=count)
+            run = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                                 env=env, capture_output=True, timeout=300)
+            err = run.stderr.decode("utf-8", "replace").strip()
+            out[how] = d if run.returncode == 0 and not err else "ошибка: " + (err or str(run.returncode))
+    elif sys.platform == "darwin":
+        d = os.path.join(dest, "ditto")
+        run = subprocess.run(["ditto", "-x", "-k", zip_path, d], capture_output=True)
+        out["ditto"] = d if run.returncode == 0 else "ошибка: " + run.stderr.decode("utf-8", "replace")
+    else:
+        d = os.path.join(dest, "zipfile")
+        zipfile.ZipFile(zip_path).extractall(d)
+        out["zipfile"] = d
+    return out
+
+
+def test_windows_archive_unpack():
+    """Архив проекта с русскими именами папок и файлов распаковывается штатными
+    средствами системы с теми же именами, и проект из распакованной копии открывается
+    со всеми слоями и объектами."""
+    import zipfile
+
+    from temp_layers_to_folder import packager
+
+    j = os.path.join
+    root = j(OUT, "распаковка")
+    P = j(root, "ВЛ 220 кВ «Северная — Южная»")
+    src = _vector_file(j(P, "data", "ЗОУИТ и ООПТ", "Охранная зона №1.gpkg"), "GPKG", n=2)
+    p, layer = _one_layer_project(src, "Охранная зона №1", j(P, "Проект ЛЭП.qgz"))
+    mem = QgsVectorLayer("Point?crs=EPSG:4326&field=имя:string(20)", "Черновик — ёлки", "memory")
+    f = QgsFeature(mem.fields())
+    f.setAttributes(["ёлка"])
+    f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(39.1, 48.5)))
+    mem.dataProvider().addFeature(f)
+    p.addMapLayer(mem)
+    try:
+        items, _ = saver.find_layers(p, temporary_only=False)
+        res = packager.consolidate_project(p, items, "gpkg", include_fonts=False, keep_structure=True)
+        assert all(r["ok"] for r in res["results"]), res["results"]
+        names = {unicodedata.normalize("NFC", n) for n in zipfile.ZipFile(res["zip"]).namelist()
+                 if not n.endswith("/")}
+        assert any("ЗОУИТ и ООПТ/Охранная зона №1.gpkg" in n for n in names), names
+        top = os.path.splitext(os.path.basename(res["zip"]))[0]
+        for how, d in _unpack_with_system_tools(res["zip"], j(root, "распаковано")).items():
+            assert not d.startswith("ошибка"), (how, d)
+            got = set()
+            for folder, _dirs, files in os.walk(d):
+                got |= {unicodedata.normalize("NFC", os.path.relpath(j(folder, n), d).replace(os.sep, "/"))
+                        for n in files}
+            assert got == names, (how, sorted(got ^ names))
+            p2 = QgsProject()
+            assert p2.read(j(d, top, "Проект ЛЭП.qgz")), how
+            for lid in (layer.id(), mem.id()):
+                l2 = p2.mapLayer(lid)
+                assert l2 is not None and l2.isValid() and l2.featureCount() > 0, (how, l2 and l2.source())
+            print("      распаковка ({}): имена и слои на месте".format(how))
+    finally:
+        QgsProject.instance().clear()
 
 
 def test_dialog():

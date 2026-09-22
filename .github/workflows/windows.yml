@@ -1,0 +1,80 @@
+# Проверки модуля на Windows: ставит QGIS тем же установщиком, что сотрудники
+# (MSI с download.qgis.org), и прогоняет tests/test_plugin.py без окна.
+# Запуск вручную: gh workflow run windows.yml -R Slider007/qgis-temp-layers-to-folder
+name: Windows
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: QGIS ${{ matrix.qgis }}, Windows
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        qgis: ["3.40.15", "3.44.14"]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установщик QGIS из кэша
+        id: msi
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\qgis-msi
+          key: qgis-msi-${{ matrix.qgis }}
+
+      - name: Загрузка установщика QGIS ${{ matrix.qgis }}
+        if: steps.msi.outputs.cache-hit != 'true'
+        run: |
+          New-Item -ItemType Directory -Force C:\qgis-msi | Out-Null
+          curl.exe -L --fail --retry 5 --silent --show-error -o "C:\qgis-msi\QGIS-OSGeo4W-${{ matrix.qgis }}-1.msi" `
+            "https://download.qgis.org/downloads/QGIS-OSGeo4W-${{ matrix.qgis }}-1.msi"
+
+      - name: Установщик QGIS в кэш
+        if: steps.msi.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\qgis-msi
+          key: qgis-msi-${{ matrix.qgis }}
+
+      - name: Установка QGIS ${{ matrix.qgis }}
+        run: |
+          $msi = "C:\qgis-msi\QGIS-OSGeo4W-${{ matrix.qgis }}-1.msi"
+          $p = Start-Process msiexec.exe -Wait -PassThru `
+            -ArgumentList "/i `"$msi`" /qn /norestart /l*v C:\qgis-install.log"
+          if ($p.ExitCode -ne 0) { Get-Content C:\qgis-install.log -Tail 60; exit $p.ExitCode }
+          $bat = Get-ChildItem "C:\Program Files\QGIS*\bin\python-qgis*.bat" | Select-Object -First 1
+          if (-not $bat) { Get-ChildItem "C:\Program Files\QGIS*\bin" | Select-Object -First 80; exit 1 }
+          "QGIS_PY=$($bat.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Output "Python QGIS: $($bat.FullName)"
+
+      # Как на обычном компьютере: длинные пути (больше 260 знаков) выключены,
+      # в системе нет шрифтов со свободной лицензией — кладём один (OFL) в шрифты пользователя.
+      - name: Условия как у сотрудников
+        run: |
+          Set-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem `
+            -Name LongPathsEnabled -Value 0 -Type DWord
+          $fonts = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Fonts"
+          New-Item -ItemType Directory -Force $fonts | Out-Null
+          curl.exe -L --fail --retry 5 --silent --show-error -o (Join-Path $fonts "OpenSans.ttf") `
+            "https://github.com/google/fonts/raw/main/ofl/opensans/OpenSans%5Bwdth,wght%5D.ttf"
+
+      - name: Проверки
+        env:
+          PYTHONIOENCODING: utf-8   # только вывод; open() остаётся в кодировке системы, как в QGIS
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $root = Split-Path (Split-Path $env:QGIS_PY)
+          if (Get-ChildItem -Path "$root\apps" -Recurse -Filter qoffscreen.dll -ErrorAction SilentlyContinue |
+              Select-Object -First 1) { $env:QT_QPA_PLATFORM = "offscreen" }
+          Write-Output "QT_QPA_PLATFORM=$env:QT_QPA_PLATFORM"
+          & $env:QGIS_PY tests\test_plugin.py
+          exit $LASTEXITCODE

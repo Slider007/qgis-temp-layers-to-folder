@@ -76,6 +76,8 @@ class SaveTempLayersDialog(QDialog):
         self.folder = QgsFileWidget()
         self.folder.setStorageMode(saver._enum(QgsFileWidget, "StorageMode", "GetDirectory"))
         self.folder.setDialogTitle("Папка для сохранения")
+        self.folder.setToolTip("По умолчанию — папка «{}» рядом с файлом проекта: если её нет, "
+                               "она будет создана. Можно выбрать и другую.".format(copier.DATA_SUBDIR))
         self.folder_label = QLabel("Папка:")
         form.addRow(self.folder_label, self.folder)
 
@@ -213,10 +215,9 @@ class SaveTempLayersDialog(QDialog):
     # ------------------------------------------------------------ настройки
     def _load_settings(self):
         s = QgsSettings()
-        folder = s.value(SETTINGS + "folder", "")
-        if not folder and self.project.absolutePath():
-            folder = self.project.absolutePath()
-        self.folder.setFilePath(folder or "")
+        self._saved_folder = s.value(SETTINGS + "folder", "") or ""
+        self._folder_for = None  # файл проекта, для которого подставлена папка
+        self._sync_folder()
         # ключ «output_format», а не прежний «format»: с версии 1.2.0 по умолчанию
         # файл на каждый слой, и старый сохранённый выбор сбрасывается один раз
         idx = self.format.findData(s.value(SETTINGS + "output_format", saver.FORMATS[0]["key"]))
@@ -239,9 +240,26 @@ class SaveTempLayersDialog(QDialog):
             crs = QgsCoordinateReferenceSystem.fromWkt(wkt)
         self.crs.setCrs(crs)
 
+    def _default_folder(self):
+        """Папка data рядом с файлом проекта; у несохранённого проекта — пусто."""
+        base = self.project.absolutePath()
+        return os.path.join(base, copier.DATA_SUBDIR) if base else ""
+
+    def _sync_folder(self):
+        """Папка по умолчанию — data рядом с проектом: подставляется при открытии окна
+        и при смене проекта (открыли другой, сохранили под другим именем). Папку,
+        выбранную для того же проекта вручную, не сбрасывает. У несохранённого
+        проекта — последняя папка, куда сохраняли."""
+        project_file = self.project.fileName()
+        if project_file == self._folder_for:
+            return
+        self._folder_for = project_file
+        self.folder.setFilePath(self._default_folder() or self._saved_folder)
+
     def _save_settings(self):
         s = QgsSettings()
-        s.setValue(SETTINGS + "folder", self.folder.filePath())
+        self._saved_folder = self.folder.filePath()
+        s.setValue(SETTINGS + "folder", self._saved_folder)
         s.setValue(SETTINGS + "output_format", self.format.currentData())
         s.remove(SETTINGS + "format")
         s.setValue(SETTINGS + "gpkg_name", self.gpkg_name.text())
@@ -320,6 +338,7 @@ class SaveTempLayersDialog(QDialog):
         return item
 
     def refresh(self, *_):
+        self._sync_folder()
         unchecked = {it.data(ROLE_ID) for it in self._items() if it.checkState() != CHECKED}
         self.layers.blockSignals(True)
         self.layers.clear()
@@ -384,7 +403,10 @@ class SaveTempLayersDialog(QDialog):
         if not folder:
             QMessageBox.warning(self, self.windowTitle(), "Выберите папку для сохранения.")
             return
-        if not os.path.isdir(folder):
+        default = self._default_folder()
+        is_default = bool(default) and os.path.normcase(os.path.abspath(folder)) == \
+            os.path.normcase(os.path.abspath(default))
+        if not os.path.isdir(folder) and not is_default:  # data рядом с проектом создаётся без вопроса
             answer = QMessageBox.question(
                 self, self.windowTitle(),
                 "Папка не существует:\n{}\n\nСоздать её?".format(folder))

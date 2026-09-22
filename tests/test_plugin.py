@@ -2042,6 +2042,90 @@ def test_plugin_window_non_modal():
     assert plugin.dialog is None and not d.isVisible()
 
 
+class _FakeIface:
+    """iface для окна модуля без QGIS: главное окно и полоса сообщений."""
+
+    def __init__(self):
+        from qgis.PyQt.QtWidgets import QMainWindow
+
+        self.w, self.messages = QMainWindow(), []
+        messages = self.messages
+
+        class Bar:
+            def pushMessage(self, *a, **k):
+                messages.append(a)
+
+        self.bar = Bar()
+
+    def mainWindow(self): return self.w
+    def messageBar(self): return self.bar
+    def layerTreeView(self): return None
+
+
+def test_dialog_default_folder():
+    """Папка для временных слоёв по умолчанию — data рядом с файлом проекта: есть —
+    пишется в неё, нет — создаётся без вопроса. Своя папка для того же проекта не
+    сбрасывается, несуществующая своя — с вопросом; другой проект — снова его data;
+    у несохранённого — последняя папка, куда сохраняли."""
+    from qgis.PyQt.QtWidgets import QMessageBox
+
+    from temp_layers_to_folder import dialog as dlg_mod
+
+    j = os.path.join
+    root = j(OUT, "папка data")
+    P = j(root, "Проект ВЛ")
+    os.makedirs(P)
+    p = QgsProject.instance()
+    p.clear()
+
+    def memory(name):
+        mem = QgsVectorLayer("Point?crs=EPSG:4326&field=n:integer", name, "memory")
+        f = QgsFeature(mem.fields())
+        f.setAttributes([1])
+        f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(39.1, 48.5)))
+        mem.dataProvider().addFeature(f)
+        p.addMapLayer(mem)
+        return mem
+
+    first = memory("Первый")
+    assert p.write(j(P, "Проект ВЛ.qgz"))
+    asked = []
+    QMessageBox.question = staticmethod(lambda *a, **k: asked.append(a[2]) or QMessageBox.StandardButton.No)
+    iface = _FakeIface()
+    d = dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow())
+    d.mode_temp.setChecked(True)
+    data = j(P, "data")
+    assert _norm(d.folder.filePath()) == _norm(data) and not os.path.exists(data), d.folder.filePath()
+    assert "«data» рядом с файлом проекта" in d.folder.toolTip()
+    d.run()  # папки нет — создаётся без вопроса
+    assert not asked and os.path.isdir(data), asked
+    assert _norm(_layer_file(first)).startswith(_norm(data) + os.sep), first.source()
+    second = memory("Второй")  # папка уже есть — пишется в неё
+    d.refresh()
+    assert _norm(d.folder.filePath()) == _norm(data)
+    d.run()
+    assert not asked and _norm(_layer_file(second)).startswith(_norm(data) + os.sep), second.source()
+
+    own = j(root, "своя")  # своя папка не сбрасывается; её нет — окно спрашивает
+    d.folder.setFilePath(own)
+    memory("Третий")
+    d.refresh()
+    assert d.folder.filePath() == own
+    d.run()
+    assert len(asked) == 1 and own in asked[0] and not os.path.exists(own), asked
+
+    P2 = j(root, "Другой")  # другой проект — снова data рядом с ним
+    os.makedirs(P2)
+    assert p.write(j(P2, "Другой.qgz"))
+    d.refresh()
+    assert _norm(d.folder.filePath()) == _norm(j(P2, "data")), d.folder.filePath()
+    p.clear()  # несохранённый проект — последняя папка, куда сохраняли
+    d.refresh()
+    assert _norm(d.folder.filePath()) == _norm(data), d.folder.filePath()
+    d.close()
+    d.deleteLater()
+
+
 # ------------------------------------------------------------------ Windows
 # Проверки идут на любой системе, но написаны ради Windows (.github/workflows/windows.yml):
 # другой диск, путь длиннее 260 знаков, файл, занятый другой программой, распаковка

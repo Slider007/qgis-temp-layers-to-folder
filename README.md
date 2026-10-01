@@ -126,7 +126,7 @@ D:\GIS\dem.tif                        →    raster/external_links/D/GIS/dem.tif
 
 ## Совместимость
 
-QGIS 3.40 и новее. Проверен на QGIS 3.40 и 3.44 под macOS и Windows (на Windows — проверками без окна QGIS, `.github/workflows/windows.yml`). Код подготовлен для QGIS 4 (Qt6), но в QGIS 4 пока не проверялся.
+QGIS 3.40 и новее, включая QGIS 4 (Qt6). Проверен на QGIS 3.40, 3.44 и 4.2 под macOS — проверками и в настоящем окне QGIS; на Windows — проверками без окна QGIS на 3.40 и 3.44 (`.github/workflows/windows.yml`).
 
 ## Разработка
 

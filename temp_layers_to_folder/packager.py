@@ -324,12 +324,14 @@ def _archive_project_copy(project_file, keep_ids, dest):
     except AttributeError:
         flags = QgsProject.ReadFlags(QgsProject.FlagDontResolveLayers)
     if not copy.read(project_file, flags):
-        raise RuntimeError("не удалось прочитать проект: " + copy.error())
+        raise RuntimeError("не удалось прочитать файл проекта ({}): закройте его в других программах "
+                           "и повторите".format(copy.error() or "без пояснения"))
     drop = [lid for lid in copy.mapLayers() if lid not in keep_ids]
     if drop:
         copy.removeMapLayers(drop)
     if not copy.write(dest):
-        raise RuntimeError("не удалось записать копию проекта: " + copy.error())
+        raise RuntimeError("не удалось записать копию проекта для архива ({}): проверьте, что в папке "
+                           "проекта есть место и она не защищена от записи".format(copy.error() or "без пояснения"))
     copy.clear()
 
 
@@ -568,9 +570,11 @@ def consolidate_project(project, items, fmt_key, crs=None, save_styles=True, inc
     if save_project is not None:
         save_project()
     elif not project.write():
-        raise RuntimeError("не удалось сохранить проект: " + project.error())
+        raise RuntimeError("не удалось сохранить проект ({}): проверьте, что файл проекта не открыт "
+                           "в другой программе и не защищён от записи".format(project.error() or "без пояснения"))
     if project.isDirty():
-        raise RuntimeError("проект не сохранён — архив не собирался")
+        raise RuntimeError("проект не сохранён, поэтому архив не собирался: сохраните проект и "
+                           "нажмите «Собрать» ещё раз")
 
     # 2. шрифты в data_all/fonts и архив рядом с проектом
     step(len(items) + 1, "шрифты")

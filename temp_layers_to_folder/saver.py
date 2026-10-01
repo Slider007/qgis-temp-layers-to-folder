@@ -72,6 +72,8 @@ BUSY_FILE = ("файл «{}» занят другой программой (на
              "закройте её и повторите")
 NOT_REPLACED = ("не удалось заменить файл «{}»: он занят другой программой (например, "
                 "Яндекс.Диском или вторым QGIS) или защищён от записи")
+NOT_REPOINTED = ("{} — но слой проекта не переключился на него: данные на месте, добавьте "
+                 "файл в проект вручную («Слой → Добавить слой»)")
 
 
 def error_text(error, path=""):
@@ -472,7 +474,8 @@ def _write_vector(layer, path, driver, layer_name, action, transform_context, ct
             raise RuntimeError(LONG_PATH)
         if action == CREATE_FILE and os.path.exists(path):  # GDAL не смог удалить прежний файл
             raise RuntimeError(NOT_REPLACED.format(os.path.basename(path)))
-        raise RuntimeError(message or "ошибка записи (код {})".format(error))
+        raise RuntimeError(message or "ошибка записи (код {}): проверьте, что файл не открыт в другой "
+                           "программе и в папке есть свободное место".format(error))
     return new_file, new_layer
 
 
@@ -545,7 +548,8 @@ def _gdal_to_geotiff(src, dest_folder, base, overwrite, taken, protected, crs=No
     else:
         ds = gdal.Translate(dest, src, options=gdal.TranslateOptions(format="GTiff", creationOptions=creation))
     if ds is None:
-        raise RuntimeError("GDAL: " + (gdal.GetLastErrorMsg() or "не удалось записать растр"))
+        raise RuntimeError("GDAL: " + (gdal.GetLastErrorMsg() or "не удалось записать растр — проверьте, "
+                           "что в папке есть свободное место и файл не занят другой программой"))
     ds = None
     return dest, stem
 
@@ -690,8 +694,9 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
             if isinstance(layer, QgsVectorLayer) and layer.isEditable():
                 if temporary:
                     if not layer.commitChanges():
-                        raise RuntimeError("не удалось завершить редактирование: "
-                                           + "; ".join(layer.commitErrors()))
+                        raise RuntimeError("не удалось применить правки слоя ({}): сохраните или "
+                                           "отмените их в QGIS и повторите".format(
+                                               "; ".join(layer.commitErrors()) or "без пояснения"))
                     notes.append("правки слоя были применены")
                 elif layer.isModified():
                     # исходные данные не трогаем: правки попадут только в копию
@@ -723,7 +728,7 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                 res.update(uri=uri, provider=layer.providerType())
                 keep = layer.crs() if layer.crs().isValid() else None  # СК могла быть назначена вручную
                 if can_repoint and not _repoint(layer, uri, layer.providerType(), project, keep):
-                    raise RuntimeError("файл скопирован, но слой не удалось переключить на него")
+                    raise RuntimeError(NOT_REPOINTED.format("файл скопирован"))
                 res.update(ok=True, path=path)
 
             elif kind == "raster":
@@ -734,7 +739,7 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                     layer.saveNamedStyle(os.path.splitext(path)[0] + ".qml")
                 res.update(uri=path, provider="gdal")
                 if can_repoint and not _repoint(layer, path, "gdal", project, target):
-                    raise RuntimeError("файл сохранён, но слой не удалось переключить на него")
+                    raise RuntimeError(NOT_REPOINTED.format("файл сохранён"))
                 res.update(ok=True, path=path)
 
             elif fmt["single"]:
@@ -754,7 +759,7 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                     if err:
                         notes.append("стиль не сохранён: " + err)
                 if can_repoint and not _repoint(layer, uri, "ogr", project, target):
-                    raise RuntimeError("данные сохранены, но слой не удалось переключить на них")
+                    raise RuntimeError(NOT_REPOINTED.format("данные сохранены"))
                 res.update(ok=True, path="{} → {}".format(new_file, new_layer))
 
             else:
@@ -793,7 +798,7 @@ def save_layers(project, items, folder, fmt_key, gpkg_name="temporary_layers",
                     if err:
                         notes.append("стиль не сохранён: " + err)
                 if can_repoint and not _repoint(layer, uri, "ogr", project, target):
-                    raise RuntimeError("файл сохранён, но слой не удалось переключить на него")
+                    raise RuntimeError(NOT_REPOINTED.format("файл сохранён"))
                 res.update(ok=True, path=new_file)
 
         except Cancelled:

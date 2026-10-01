@@ -2466,6 +2466,143 @@ def test_windows_archive_unpack():
         QgsProject.instance().clear()
 
 
+def _ui_dialog(layers=3, name="Слой"):
+    """Окно модуля на проекте с несколькими временными слоями (для проверок вёрстки)."""
+    from temp_layers_to_folder import dialog as dlg_mod
+
+    p = QgsProject.instance()
+    p.clear()
+    for i in range(layers):
+        mem = QgsVectorLayer("Point?crs=EPSG:4326&field=n:integer", "{} {:02d}".format(name, i + 1),
+                             "memory")
+        f = QgsFeature(mem.fields())
+        f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(39.1, 48.5)))
+        mem.dataProvider().addFeature(f)
+        p.addMapLayer(mem)
+    iface = _FakeIface()
+    return dlg_mod.SaveTempLayersDialog(iface, iface.mainWindow()), iface
+
+
+def _rect(widget, root):
+    from qgis.PyQt.QtCore import QPoint, QRect
+
+    return QRect(widget.mapTo(root, QPoint(0, 0)), widget.size())
+
+
+def test_dialog_min_size_no_overlap():
+    """Окно, сжатое до минимума, не кладёт кнопки списка поверх самого списка:
+    иначе нижние строки не видно и мышью в них не попасть."""
+    d, _iface = _ui_dialog(layers=15)
+    d.show()
+    QgsApplication.processEvents()
+    d.resize(d.minimumSizeHint())
+    QgsApplication.processEvents()
+    d.layout().activate()
+    QgsApplication.processEvents()
+    try:
+        listed = _rect(d.layers, d)
+        for widget, what in ((d.btn_all, "Выбрать все"), (d.btn_none, "Снять все"),
+                             (d.btn_refresh, "Обновить список"), (d.count_label, "счётчик")):
+            over = listed.intersected(_rect(widget, d))
+            assert over.isEmpty(), "«{}» наезжает на список: {}".format(what, over)
+        assert d.layers.height() >= 120, d.layers.height()
+    finally:
+        d.close()
+        QgsProject.instance().clear()
+
+
+def test_dialog_log_grows_with_window():
+    """Журнал итога растёт вместе с окном: после сохранения 20 слоёв его не листают
+    по три строки."""
+    d, _iface = _ui_dialog(layers=3)
+    d.log.setVisible(True)
+    d.show()
+    QgsApplication.processEvents()
+    d.resize(d.sizeHint())
+    QgsApplication.processEvents()
+    d.layout().activate()
+    QgsApplication.processEvents()
+    small = d.log.height()
+    d.resize(d.width(), d.height() + 400)
+    QgsApplication.processEvents()
+    d.layout().activate()
+    QgsApplication.processEvents()
+    try:
+        assert d.log.height() > small + 50, (small, d.log.height())
+    finally:
+        d.close()
+        QgsProject.instance().clear()
+
+
+def test_dialog_error_is_explained():
+    """Ошибка, вылетевшая мимо сохранения слоёв (папку не создать, файл занят), тоже
+    объясняется по-русски: журнал показывает текст saver.error_text, а не «[WinError 32]»."""
+    from temp_layers_to_folder import dialog as dlg_mod
+    from temp_layers_to_folder import saver as saver_mod
+
+    d, _iface = _ui_dialog(layers=1)
+    d.mode_temp.setChecked(True)
+    d.folder.setFilePath(os.path.join(OUT, "ошибка"))
+    os.makedirs(d.folder.filePath(), exist_ok=True)
+    busy = OSError(13, "Permission denied", os.path.join(d.folder.filePath(), "Слой 01.gpkg"))
+    busy.winerror = 32  # как на Windows: файл занят другой программой
+    original = saver_mod.save_layers
+    saver_mod.save_layers = lambda *a, **k: (_ for _ in ()).throw(busy)
+    try:
+        d.run()
+        text = d.log.toPlainText()
+        assert "занят другой программой" in text, text
+        assert "WinError" not in text and "Permission denied" not in text, text
+    finally:
+        saver_mod.save_layers = original
+        assert dlg_mod.saver is saver_mod
+        d.close()
+        QgsProject.instance().clear()
+
+
+def test_dialog_hints_follow_theme():
+    """Пояснения серые по палитре, а не жёстким цветом в стиле: иначе на тёмной теме
+    QGIS их почти не видно. У подписей есть buddy — клик переводит фокус в поле."""
+    d, _iface = _ui_dialog(layers=1)
+    try:
+        hints = [w for w in d.findChildren(type(d.package_hint)) if w.wordWrap()]
+        assert len(hints) >= 2, len(hints)
+        for hint in hints:
+            assert "color" not in hint.styleSheet(), hint.styleSheet()
+            own = hint.palette().color(hint.foregroundRole())
+            plain = d.palette().color(d.foregroundRole())
+            assert own != plain, (own.name(), plain.name())
+        assert d.folder_label.buddy() is d.folder
+        assert d.mode_label.buddy() is d.mode_temp
+        assert d.gpkg_name_label.buddy() is d.gpkg_name
+    finally:
+        d.close()
+        QgsProject.instance().clear()
+
+
+def test_messages_say_what_to_do():
+    """Сообщение об ошибке говорит человеку следующий шаг, а не только что не вышло."""
+    import re as _re
+
+    from temp_layers_to_folder import saver as saver_mod
+
+    actions = ("повторите", "проверьте", "сохраните", "добавьте", "закройте", "перенесите",
+               "выберите", "откройте", "отмените", "соберите", "подключите", "нажмите")
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bad = []
+    for name in ("saver.py", "copier.py", "packager.py", "dialog.py"):
+        src = open(os.path.join(here, "temp_layers_to_folder", name), encoding="utf-8").read()
+        # текст, собранный из подряд идущих строковых литералов после RuntimeError(
+        for chunk in _re.findall(r'RuntimeError\(\s*((?:"[^"]*"\s*)+)\)', src):
+            text = " ".join(_re.findall(r'"([^"]*)"', chunk))
+            if not _re.search("[А-Яа-яЁё]", text):
+                continue
+            if not any(word in text.lower() for word in actions):
+                bad.append("{}: {}".format(name, text[:70]))
+    assert not bad, "ошибки без следующего шага:\n" + "\n".join(bad)
+    assert "добавьте файл в проект вручную" in saver_mod.NOT_REPOINTED, saver_mod.NOT_REPOINTED
+
+
 def test_dialog():
     from qgis.PyQt.QtWidgets import QMainWindow, QMessageBox
 

@@ -413,7 +413,8 @@ def copy_layers(project, items, data_dir, project_dir, progress=None, is_cancell
             # та же и у копии: QGIS перечитал бы её из файла
             if not saver._repoint(layer, uri, layer.providerType(), project, crs if crs.isValid() else None):
                 saver._repoint(layer, old, layer.providerType(), project, crs if crs.isValid() else None)
-                raise RuntimeError("файл скопирован, но слой не открылся из копии — оставлен как был")
+                raise RuntimeError("файл скопирован, но слой не открылся из копии — слой оставлен на старом "
+                                   "файле: подключите копию из data_all вручную")
             res.update(ok=True, path=dest, uri=uri, message=note)
         except saver.Cancelled:
             raise
@@ -433,7 +434,8 @@ def _copy_unit(path, types, data_dir, real_data, project_dir, taken, home, max_d
     типа данных или пустая строка; structure — раскладывать по подпапкам; shortener —
     PathShortener для слишком длинных путей); возвращает (путь копии, замечание)."""
     if os.path.isdir(path) and saver.relative_inside(real_data, path) is not None:
-        raise RuntimeError("папка-источник содержит саму data_all — скопировать её нельзя")
+        raise RuntimeError("папка слоя содержит саму data_all — скопировать её нельзя: перенесите "
+                           "данные слоя в отдельную папку рядом с проектом и повторите")
     sub = target_subdir(os.path.dirname(os.path.normpath(path)), project_dir, data_dir, home, max_depth,
                         kind=kind) if structure else ""
     sub, short_note = shorten_subdir(shortener, sub, _longest_name(path, types))

@@ -4,7 +4,7 @@ from qgis.core import (Qgis, QgsCoordinateReferenceSystem, QgsIconUtils, QgsProj
                        QgsVectorLayer)
 from qgis.gui import QgsFileWidget, QgsProjectionSelectionWidget
 from qgis.PyQt.QtCore import Qt, QUrl
-from qgis.PyQt.QtGui import QDesktopServices
+from qgis.PyQt.QtGui import QColor, QDesktopServices, QPalette
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -16,6 +16,7 @@ from qgis.PyQt.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -36,6 +37,49 @@ BOX_TITLES = {MODE_TEMP: "Временные слои проекта", MODE_PACK
 CHECKED = Qt.CheckState.Checked
 UNCHECKED = Qt.CheckState.Unchecked
 ROLE_ID = Qt.ItemDataRole.UserRole
+
+
+class WrapLabel(QLabel):
+    """Пояснение с переносом строк, которое честно говорит раскладке свою высоту.
+
+    Обычный QLabel с wordWrap сообщает минимум в одну строку, а рисует пять: при
+    уменьшении окна раскладка отдаёт недостающие пиксели за счёт соседей, и кнопки
+    списка ложатся поверх самого списка."""
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self.setWordWrap(True)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fix_height()
+
+    def setText(self, text):
+        super().setText(text)
+        self._fix_height()
+
+    def _fix_height(self):
+        """Высота под текущую ширину — как настоящий минимум: раскладка перестаёт
+        считать, что подпись уместится в одну строку."""
+        width = self.width()
+        if width > 0:
+            self.setMinimumHeight(self.heightForWidth(width))
+
+
+def _muted(label):
+    """Приглушённый цвет пояснения — из палитры, а не «gray»: жёсткий цвет не виден
+    на тёмной теме QGIS. Цвет текста смешивается с цветом фона."""
+    palette = label.palette()
+    role = label.foregroundRole()
+    text, back = palette.color(role), palette.color(QPalette.ColorRole.Window)
+    palette.setColor(role, QColor((text.red() + back.red()) // 2,
+                                  (text.green() + back.green()) // 2,
+                                  (text.blue() + back.blue()) // 2))
+    label.setPalette(palette)
+    return label
 
 
 def _bool(value, default):
@@ -71,7 +115,9 @@ class SaveTempLayersDialog(QDialog):
         mode_col = QVBoxLayout()
         mode_col.addWidget(self.mode_temp)
         mode_col.addWidget(self.mode_package)
-        form.addRow("Режим:", mode_col)
+        self.mode_label = QLabel("Режим:")  # поле — не виджет, buddy ставим сами
+        self.mode_label.setBuddy(self.mode_temp)
+        form.addRow(self.mode_label, mode_col)
 
         self.folder = QgsFileWidget()
         self.folder.setStorageMode(saver._enum(QgsFileWidget, "StorageMode", "GetDirectory"))
@@ -79,6 +125,7 @@ class SaveTempLayersDialog(QDialog):
         self.folder.setToolTip("По умолчанию — папка «{}» рядом с файлом проекта: если её нет, "
                                "она будет создана. Можно выбрать и другую.".format(copier.DATA_SUBDIR))
         self.folder_label = QLabel("Папка:")
+        self.folder_label.setBuddy(self.folder)
         form.addRow(self.folder_label, self.folder)
 
         self.format = QComboBox()
@@ -104,20 +151,21 @@ class SaveTempLayersDialog(QDialog):
         self.gpkg_name = QLineEdit()
         self.gpkg_name.setPlaceholderText("temporary_layers")
         self.gpkg_name_label = QLabel("Имя файла .gpkg:")
+        self.gpkg_name_label.setBuddy(self.gpkg_name)
         form.addRow(self.gpkg_name_label, self.gpkg_name)
         root.addLayout(form)
         # отдельной строкой, а не в форме: QFormLayout обрезает переносимый текст
-        self.package_hint = QLabel()
-        self.package_hint.setWordWrap(True)
-        self.package_hint.setStyleSheet("color: gray;")
+        self.package_hint = _muted(WrapLabel())
         root.addWidget(self.package_hint)
 
         # --- список слоёв
         box = self.layers_box = QGroupBox()
         box_layout = QVBoxLayout(box)
+        # иначе при уменьшении окна строка кнопок ложится поверх нижних строк списка
+        box_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         self.layers = QListWidget()
         self.layers.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.layers.setMinimumHeight(200)  # в режиме «все слои» список бывает длинным
+        self.layers.setMinimumHeight(140)  # в режиме «все слои» список бывает длинным
         box_layout.addWidget(self.layers)
         row = QHBoxLayout()
         self.btn_all = QPushButton("Выбрать все")
@@ -129,7 +177,7 @@ class SaveTempLayersDialog(QDialog):
         row.addStretch()
         row.addWidget(self.count_label)
         box_layout.addLayout(row)
-        root.addWidget(box)
+        root.addWidget(box, 2)  # список и журнал делят свободную высоту окна 2 : 1
 
         # --- параметры
         self.replace = QCheckBox("Заменить временные слои в проекте сохранёнными")
@@ -161,11 +209,10 @@ class SaveTempLayersDialog(QDialog):
         self._pkg_widgets = (self.pkg_structure, self.pkg_archive, self.pkg_fonts)
         for w in (self.replace, self.styles, self.overwrite) + self._pkg_widgets:
             root.addWidget(w)
-        hint = QLabel("Растры сохраняются отдельными файлами независимо от выбранного формата: "
-                      "без смены СК — копируются как есть (VRT и растры из баз — в GeoTIFF), "
-                      "со сменой — перепроецируются в GeoTIFF.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: gray;")
+        hint = _muted(WrapLabel("Растры сохраняются отдельными файлами, в каком бы формате ни "
+                                "сохранялись остальные слои."))
+        hint.setToolTip("Без смены системы координат растры копируются как есть; VRT и растры из "
+                        "баз данных переводятся в GeoTIFF, со сменой СК — перепроецируются в GeoTIFF.")
         root.addWidget(hint)
 
         self.progress = QProgressBar()
@@ -174,8 +221,10 @@ class SaveTempLayersDialog(QDialog):
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setVisible(False)
-        self.log.setMaximumHeight(150)
-        root.addWidget(self.log)
+        # без жёсткого предела: итог по 20 слоям не придётся листать по три строки —
+        # журнал растёт вместе с окном
+        self.log.setMinimumHeight(90)
+        root.addWidget(self.log, 1)
 
         self.buttons = QDialogButtonBox()
         self.btn_save = self.buttons.addButton("Сохранить", QDialogButtonBox.ButtonRole.AcceptRole)
@@ -437,7 +486,7 @@ class SaveTempLayersDialog(QDialog):
             self.log.appendPlainText("Отменено.")
         except Exception as e:  # noqa: BLE001
             results = None
-            self.log.appendPlainText("Ошибка: {}".format(e))
+            self.log.appendPlainText("Ошибка: {}".format(saver.error_text(e, folder)))
         finally:
             self._finish()
 
@@ -521,7 +570,8 @@ class SaveTempLayersDialog(QDialog):
             self.log.appendPlainText("Отменено. Часть слоёв могла уже переключиться на data_all — "
                                      "проект не сохранён, можно закрыть его без сохранения.")
         except Exception as e:  # noqa: BLE001
-            self.log.appendPlainText("Ошибка: {}".format(e))
+            self.log.appendPlainText("Ошибка: {}".format(
+                saver.error_text(e, packager.data_dir(self.project))))
         finally:
             self._finish()
         if result is not None:
@@ -541,7 +591,9 @@ class SaveTempLayersDialog(QDialog):
         if self.project.fileName() and not self.project.isDirty():
             self._update_package_hint()
             return True
-        QMessageBox.warning(self, self.windowTitle(), "Проект не сохранён — упаковка отменена.")
+        QMessageBox.warning(self, self.windowTitle(),
+                            "Проект не сохранён, поэтому сборка отменена.\n\nСохраните проект "
+                            "(«Проект → Сохранить») и нажмите «Собрать» ещё раз.")
         return False
 
     def _report_package(self, pkg):
